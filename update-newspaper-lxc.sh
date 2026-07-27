@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ============================================================
-#  Zeitungs-LXC Update
-#  Spielt die aktuelle App-Version in einen bereits bestehenden
-#  Zeitungs-Container ein (Feeds/Ausgaben bleiben erhalten).
+#  Zeitungs-LXC Installer fuer Proxmox VE
+#  Erstellt einen LXC-Container, der aus RSS-Feeds automatisch
+#  eine taegliche "Zeitung" (Web-App + PDF) generiert.
 #  Ausfuehren auf der Proxmox-Host-Shell:
-#    bash update-newspaper-lxc.sh
+#    bash install-newspaper-lxc.sh
 # ============================================================
 set -euo pipefail
 
@@ -17,18 +17,69 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-read -rp "Container-ID der bestehenden Zeitung: " CTID
-if [ -z "$CTID" ]; then
-  echo "Container-ID erforderlich." >&2
+echo "=== Zeitungs-LXC Installer ==="
+echo ""
+
+DEFAULT_CTID=$(pvesh get /cluster/nextid)
+read -rp "Container-ID [$DEFAULT_CTID]: " CTID
+CTID=${CTID:-$DEFAULT_CTID}
+
+read -rp "Hostname [zeitung]: " CT_HOSTNAME
+CT_HOSTNAME=${CT_HOSTNAME:-zeitung}
+
+read -rp "Storage fuer Root-Disk [local-lvm]: " STORAGE
+STORAGE=${STORAGE:-local-lvm}
+
+read -rp "Netzwerk-Bridge [vmbr0]: " BRIDGE
+BRIDGE=${BRIDGE:-vmbr0}
+
+read -rp "RAM in MB [2048]: " RAM
+RAM=${RAM:-2048}
+
+read -rp "CPU-Kerne [2]: " CORES
+CORES=${CORES:-2}
+
+read -rp "Festplatte in GB [8]: " DISK
+DISK=${DISK:-8}
+
+echo ""
+echo "Aktualisiere Vorlagenliste..."
+pveam update >/dev/null 2>&1 || true
+TEMPLATE=$(pveam available --section system 2>/dev/null | grep -o 'debian-12[^ ]*\.tar\.zst' | sort -V | tail -n1)
+if [ -z "$TEMPLATE" ]; then
+  echo "Konnte kein Debian-12-Template finden. Bitte manuell pruefen mit: pveam available" >&2
   exit 1
 fi
-if ! pct status "$CTID" >/dev/null 2>&1; then
-  echo "Container $CTID wurde nicht gefunden." >&2
-  exit 1
+if ! pveam list local 2>/dev/null | grep -q "$TEMPLATE"; then
+  echo "Lade Vorlage $TEMPLATE herunter..."
+  pveam download local "$TEMPLATE"
 fi
 
+echo "Erstelle Container $CTID ($CT_HOSTNAME)..."
+pct create "$CTID" "local:vztmpl/$TEMPLATE" \
+  --hostname "$CT_HOSTNAME" \
+  --cores "$CORES" \
+  --memory "$RAM" \
+  --swap 512 \
+  --rootfs "${STORAGE}:${DISK}" \
+  --net0 "name=eth0,bridge=${BRIDGE},ip=dhcp" \
+  --unprivileged 1 \
+  --features nesting=1 \
+  --onboot 1
+
+pct start "$CTID"
+
+echo "Warte auf Netzwerk..."
+IP=""
+for i in $(seq 1 30); do
+  IP=$(pct exec "$CTID" -- hostname -I 2>/dev/null | awk '{print $1}') || true
+  [ -n "$IP" ] && break
+  sleep 2
+done
+
+echo "Baue Anwendungspaket..."
 STAGE=$(mktemp -d)
-mkdir -p "$STAGE/app/templates" "$STAGE/app/static"
+mkdir -p "$STAGE/app/templates" "$STAGE/app/static" "$STAGE/systemd"
 
 cat > "$STAGE/app/main.py" <<'ZEITUNG_FILE_EOF'
 from pathlib import Path
@@ -70,6 +121,25 @@ def admin(request: Request):
 @app.post("/feeds/add")
 def feeds_add(url: str = Form(...), name: str = Form(""), category: str = Form("Allgemein")):
     db.add_feed(url.strip(), name.strip(), category.strip() or "Allgemein")
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/feeds/bulk")
+def feeds_bulk(feeds_text: str = Form(...)):
+    added = 0
+    for line in feeds_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        url = parts[0]
+        if not url:
+            continue
+        name = parts[1] if len(parts) > 1 else ""
+        category = parts[2] if len(parts) > 2 else "Allgemein"
+        db.add_feed(url, name, category or "Allgemein")
+        added += 1
+    db.set_setting("last_status", f"{added} Feed(s) importiert.")
     return RedirectResponse("/", status_code=303)
 
 
@@ -506,6 +576,12 @@ cat > "$STAGE/app/templates/admin.html" <<'ZEITUNG_FILE_EOF'
     <button type="submit">Hinzufügen</button>
   </form>
 
+  <h2>Mehrere Feeds auf einmal importieren</h2>
+  <form method="post" action="/feeds/bulk" class="bulk-feed-form">
+    <textarea name="feeds_text" rows="6" placeholder="Eine URL pro Zeile. Optional mit Name und Rubrik: URL | Name | Rubrik"></textarea>
+    <button type="submit">Alle importieren</button>
+  </form>
+
   <h2>Feeds ({{ feeds|length }})</h2>
   {% if feeds %}
   <table class="feed-table">
@@ -929,6 +1005,28 @@ h2 { font-size: 16px; margin-top: 32px; border-bottom: 1px solid var(--border); 
   border-radius: 6px;
   cursor: pointer;
 }
+.bulk-feed-form {
+  margin-top: 10px;
+}
+.bulk-feed-form textarea {
+  width: 100%;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 13px;
+  font-family: ui-monospace, monospace;
+  resize: vertical;
+  box-sizing: border-box;
+}
+.bulk-feed-form button {
+  margin-top: 8px;
+  padding: 10px 16px;
+  border: none;
+  background: var(--ink);
+  color: #fff;
+  border-radius: 6px;
+  cursor: pointer;
+}
 table.feed-table {
   width: 100%;
   border-collapse: collapse;
@@ -967,20 +1065,86 @@ button.del {
   font-size: 13px;
 }
 ZEITUNG_FILE_EOF
+cat > "$STAGE/systemd/zeitung-web.service" <<'ZEITUNG_FILE_EOF'
+[Unit]
+Description=Zeitung Web-App (Feed-Verwaltung + Auslieferung)
+After=network.target
 
-tar czf "$STAGE/zeitung-update.tar.gz" -C "$STAGE" app
+[Service]
+Type=simple
+WorkingDirectory=/opt/zeitung/app
+ExecStart=/opt/zeitung/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8080
+Restart=always
+RestartSec=3
 
-echo "Uebertrage aktualisierte Dateien in Container $CTID..."
-pct push "$CTID" "$STAGE/zeitung-update.tar.gz" /root/zeitung-update.tar.gz
+[Install]
+WantedBy=multi-user.target
+ZEITUNG_FILE_EOF
+cat > "$STAGE/systemd/zeitung-generate.service" <<'ZEITUNG_FILE_EOF'
+[Unit]
+Description=Erstellt die taegliche Zeitungsausgabe aus den aktiven RSS-Feeds
 
-pct exec "$CTID" -- bash -c "
-  tar xzf /root/zeitung-update.tar.gz -C /opt/zeitung &&
-  /opt/zeitung/venv/bin/pip install -q -r /opt/zeitung/app/requirements.txt &&
-  systemctl restart zeitung-web.service
-"
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/zeitung/app
+ExecStart=/opt/zeitung/venv/bin/python /opt/zeitung/app/run_generate.py
+ZEITUNG_FILE_EOF
+cat > "$STAGE/systemd/zeitung-generate.timer" <<'ZEITUNG_FILE_EOF'
+[Unit]
+Description=Taegliche Zeitungserstellung um 05:30 Uhr
+
+[Timer]
+OnCalendar=*-*-* 05:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+ZEITUNG_FILE_EOF
+cat > "$STAGE/container-install.sh" <<'ZEITUNG_FILE_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "[1/4] Installiere Systempakete..."
+apt-get update -y
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  python3 python3-venv python3-pip python3-dev build-essential \
+  libpango-1.0-0 libpangoft2-1.0-0 libpangocairo-1.0-0 libcairo2 \
+  libgdk-pixbuf-2.0-0 libffi-dev shared-mime-info fonts-dejavu-core fonts-liberation2 >/dev/null
+
+echo "[2/4] Erstelle Python-Umgebung..."
+python3 -m venv /opt/zeitung/venv
+/opt/zeitung/venv/bin/pip install --upgrade pip -q
+/opt/zeitung/venv/bin/pip install -q -r /opt/zeitung/app/requirements.txt
+
+mkdir -p /opt/zeitung/data /opt/zeitung/output
+
+echo "[3/4] Richte systemd-Dienste ein..."
+cp /opt/zeitung/systemd/zeitung-web.service /etc/systemd/system/
+cp /opt/zeitung/systemd/zeitung-generate.service /etc/systemd/system/
+cp /opt/zeitung/systemd/zeitung-generate.timer /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now zeitung-web.service
+systemctl enable --now zeitung-generate.timer
+
+echo "[4/4] Fertig."
+IP=$(hostname -I | awk '{print $1}')
+echo ""
+echo "Zeitungs-Verwaltung erreichbar unter: http://$IP:8080"
+echo "Dort RSS-Feeds eintragen/anhaken - die erste Ausgabe kannst du sofort"
+echo "per Knopfdruck erstellen. Danach laeuft es taeglich um 05:30 Uhr automatisch."
+ZEITUNG_FILE_EOF
+
+tar czf "$STAGE/zeitung-src.tar.gz" -C "$STAGE" app systemd container-install.sh
+
+echo "Uebertrage Dateien in den Container..."
+pct push "$CTID" "$STAGE/zeitung-src.tar.gz" /root/zeitung-src.tar.gz
+
+pct exec "$CTID" -- bash -c "mkdir -p /opt/zeitung && tar xzf /root/zeitung-src.tar.gz -C /opt/zeitung && bash /opt/zeitung/container-install.sh"
 
 rm -rf "$STAGE"
 
 echo ""
-echo "Update eingespielt und Web-Dienst neu gestartet."
-echo "Feeds und bisherige Ausgaben blieben erhalten."
+echo "================================================"
+echo " Fertig!"
+echo " Zeitungs-Verwaltung: http://${IP:-<IP-des-Containers>}:8080"
+echo "================================================"
