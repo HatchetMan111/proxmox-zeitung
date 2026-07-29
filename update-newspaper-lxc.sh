@@ -116,7 +116,8 @@ def generate_now():
         db.set_setting("last_run", result["date"])
         db.set_setting(
             "last_status",
-            f"Ausgabe vom {result['date']} mit {result['article_count']} Artikel(n) erstellt.",
+            f"Ausgabe vom {result['date']} mit {result['article_count']} Artikel(n) "
+            f"in {result['section_count']} Rubriken erstellt.",
         )
     else:
         db.set_setting(
@@ -244,7 +245,11 @@ cat > "$STAGE/app/generator.py" <<'ZEITUNG_FILE_EOF'
 import html as html_module
 import json
 import re
+import urllib.request
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 
 import feedparser
@@ -264,6 +269,11 @@ MONTHS_DE = [
     "Januar", "Februar", "März", "April", "Mai", "Juni",
     "Juli", "August", "September", "Oktober", "November", "Dezember",
 ]
+
+IMAGE_MAX_BYTES = 6 * 1024 * 1024
+IMAGE_MAX_WIDTH = 1000
+IMAGE_TIMEOUT = 8
+USER_AGENT = "Mozilla/5.0 (compatible; LichtValleyZeitung/1.0; +https://example.invalid)"
 
 
 def format_date_de(dt: datetime) -> str:
@@ -296,7 +306,17 @@ def feed_summary_html(entry) -> str:
     return entry.get("summary", "") or entry.get("description", "") or ""
 
 
-def fetch_candidates(feeds, max_per_feed=6):
+def feed_image(entry):
+    media = entry.get("media_content") or entry.get("media_thumbnail")
+    if media and media[0].get("url"):
+        return media[0]["url"]
+    for link in entry.get("links", []):
+        if str(link.get("type", "")).startswith("image/") and link.get("href"):
+            return link["href"]
+    return None
+
+
+def fetch_candidates(feeds, max_per_feed=8):
     """feeds: list of dicts with url/name/category"""
     candidates = []
     seen_links = set()
@@ -322,6 +342,7 @@ def fetch_candidates(feeds, max_per_feed=6):
                     "source": feed_title,
                     "published": entry.get("published", ""),
                     "fallback_html": feed_summary_html(entry),
+                    "fallback_image": feed_image(entry),
                 }
             )
     print(f"{len(candidates)} Artikel-Kandidaten aus {len(feeds)} Feed(s) gefunden.")
@@ -330,6 +351,7 @@ def fetch_candidates(feeds, max_per_feed=6):
 
 def extract_article(candidate, min_chars=200):
     paragraphs = []
+    image_url = candidate.get("fallback_image")
     title = candidate["title"]
     author = None
 
@@ -344,6 +366,7 @@ def extract_article(candidate, min_chars=200):
                 downloaded,
                 output_format="json",
                 with_metadata=True,
+                include_images=True,
                 favor_precision=True,
             )
         except Exception:
@@ -358,6 +381,7 @@ def extract_article(candidate, min_chars=200):
                 paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
                 title = data.get("title") or title
                 author = data.get("author")
+                image_url = data.get("image") or image_url
 
     if not paragraphs and candidate.get("fallback_html"):
         # Volltext nicht erreichbar/blockiert (JS-Seite, Paywall, ...) - RSS-eigenen Text nutzen,
@@ -371,13 +395,14 @@ def extract_article(candidate, min_chars=200):
         return None
 
     excerpt = paragraphs[0][:220]
-    clean = {k: v for k, v in candidate.items() if k != "fallback_html"}
+    clean = {k: v for k, v in candidate.items() if k not in ("fallback_html", "fallback_image")}
     return {
         **clean,
         "title": title,
         "excerpt": excerpt,
         "paragraphs": paragraphs,
         "author": author,
+        "image_url": image_url,
     }
 
 
@@ -385,28 +410,101 @@ def score_article(article):
     return min(len(article.get("paragraphs", [])), 12)
 
 
-def build_edition(feeds, max_articles=10, max_candidates=40):
+def download_image(url, out_dir, filename):
+    """Laedt ein Bild lokal herunter und speichert es normalisiert als JPEG.
+    Liefert einen relativen Pfad (z.B. 'images/artikel-1.jpg') oder None."""
+    if not url:
+        return None
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=IMAGE_TIMEOUT) as resp:
+            content_type = resp.headers.get("Content-Type", "")
+            if not content_type.startswith("image/"):
+                return None
+            raw = resp.read(IMAGE_MAX_BYTES + 1)
+            if len(raw) > IMAGE_MAX_BYTES:
+                return None
+    except Exception:
+        return None
+
+    try:
+        from PIL import Image
+
+        img = Image.open(BytesIO(raw))
+        img.load()
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        elif img.mode == "L":
+            img = img.convert("RGB")
+        if img.width > IMAGE_MAX_WIDTH:
+            ratio = IMAGE_MAX_WIDTH / float(img.width)
+            img = img.resize((IMAGE_MAX_WIDTH, max(1, int(img.height * ratio))))
+        images_dir = out_dir / "images"
+        images_dir.mkdir(exist_ok=True)
+        rel_path = f"images/{filename}.jpg"
+        img.save(images_dir / f"{filename}.jpg", "JPEG", quality=82)
+        return rel_path
+    except Exception:
+        return None
+
+
+def build_edition(feeds, per_category_cap=6, max_articles=40, max_candidates=80):
     candidates = fetch_candidates(feeds)[:max_candidates]
-    articles = []
-    for c in candidates:
-        art = extract_article(c)
-        if art:
-            articles.append(art)
-        if len(articles) >= max_articles:
-            break
 
-    print(f"{len(articles)} von {len(candidates)} Kandidaten als Artikel übernommen.")
+    extracted = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(extract_article, c) for c in candidates]
+        for fut in as_completed(futures):
+            art = fut.result()
+            if art:
+                extracted.append(art)
 
-    if not articles:
+    print(f"{len(extracted)} von {len(candidates)} Kandidaten als Artikel übernommen.")
+
+    if not extracted:
         print("Keine Artikel verwertbar - keine Ausgabe erstellt.")
         return None
 
-    articles.sort(key=score_article, reverse=True)
-    lead = articles[0]
-    teasers = articles[1:]
+    # Bester Artikel insgesamt wird Aufmacher.
+    extracted.sort(key=score_article, reverse=True)
+    lead = extracted[0]
+
+    # Nach Rubrik gruppieren (jede Rubrik bekommt spaeter ihre eigene(n) Seite(n)),
+    # pro Rubrik gedeckelt, damit keine einzelne Rubrik die ganze Ausgabe dominiert.
+    by_category = OrderedDict()
+    for a in extracted:
+        by_category.setdefault(a["category"], []).append(a)
+
+    capped = []
+    for arts in by_category.values():
+        capped.extend(arts[:per_category_cap])
+    if len(capped) > max_articles:
+        capped.sort(key=score_article, reverse=True)
+        capped = capped[:max_articles]
+
+    # Finale Rubrik-Gruppen (alphabetisch, "Allgemein" ans Ende) und finale
+    # Artikel-Reihenfolge fuer Blaettern/Vor-Zurueck.
+    categories_sorted = sorted(
+        {a["category"] for a in capped},
+        key=lambda c: (c == "Allgemein", c.lower()),
+    )
+    sections_all = []
+    for cat in categories_sorted:
+        arts = sorted([a for a in capped if a["category"] == cat], key=score_article, reverse=True)
+        sections_all.append((cat, arts))
+
+    articles = [a for _, arts in sections_all for a in arts]
 
     for i, a in enumerate(articles):
         a["slug"] = f"artikel-{i + 1}-{slugify(a['title'])}"
+
+    # Rubrik-Sektionen ohne den bereits auf der Titelseite gezeigten Aufmacher,
+    # leere Rubriken (nur Aufmacher) werden uebersprungen.
+    sections = []
+    for cat, arts in sections_all:
+        rest = [a for a in arts if a["slug"] != lead["slug"]]
+        if rest:
+            sections.append((cat, rest))
 
     now = datetime.now()
     date_display = format_date_de(now)
@@ -414,8 +512,16 @@ def build_edition(feeds, max_articles=10, max_candidates=40):
     out_dir = OUTPUT_DIR / edition_date
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Bilder parallel herunterladen und lokal ablegen.
+    def _fetch_image(a):
+        a["image"] = download_image(a.get("image_url"), out_dir, a["slug"])
+        a.pop("image_url", None)
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        list(pool.map(_fetch_image, articles))
+
     front_html = env.get_template("front_page.html").render(
-        paper_name=PAPER_NAME, date_display=date_display, lead=lead, teasers=teasers
+        paper_name=PAPER_NAME, date_display=date_display, lead=lead, sections=sections
     )
     (out_dir / "index.html").write_text(front_html, encoding="utf-8")
 
@@ -436,7 +542,7 @@ def build_edition(feeds, max_articles=10, max_candidates=40):
         (out_dir / f"{a['slug']}.html").write_text(html, encoding="utf-8")
 
     print_html = env.get_template("print.html").render(
-        paper_name=PAPER_NAME, date_display=date_display, lead=lead, articles=articles
+        paper_name=PAPER_NAME, date_display=date_display, lead=lead, sections=sections
     )
     pdf_path = out_dir / "zeitung.pdf"
     try:
@@ -451,7 +557,11 @@ def build_edition(feeds, max_articles=10, max_candidates=40):
         latest_link.unlink()
     latest_link.symlink_to(out_dir.name)
 
-    return {"date": edition_date, "article_count": len(articles)}
+    return {
+        "date": edition_date,
+        "article_count": len(articles),
+        "section_count": len(sections_all),
+    }
 ZEITUNG_FILE_EOF
 cat > "$STAGE/app/run_generate.py" <<'ZEITUNG_FILE_EOF'
 import sys
@@ -481,6 +591,7 @@ feedparser==6.0.12
 trafilatura==2.1.0
 weasyprint==69.0
 python-multipart==0.0.32
+Pillow==12.3.0
 ZEITUNG_FILE_EOF
 cat > "$STAGE/app/templates/admin.html" <<'ZEITUNG_FILE_EOF'
 <!DOCTYPE html>
@@ -505,7 +616,7 @@ cat > "$STAGE/app/templates/admin.html" <<'ZEITUNG_FILE_EOF'
     <p class="tablet-hint">Fürs Tablet als Lesezeichen: <code>{{ request.base_url }}lesen</code></p>
   </div>
 
-  <form method="post" action="/generate" class="generate-form">
+  <form method="post" action="/generate" class="generate-form" onsubmit="this.querySelector('button').disabled=true; this.querySelector('button').textContent='Erstelle Ausgabe – das kann 1-2 Minuten dauern…';">
     <button type="submit">Zeitung jetzt erstellen</button>
   </form>
 
@@ -571,21 +682,27 @@ cat > "$STAGE/app/templates/front_page.html" <<'ZEITUNG_FILE_EOF'
 
 <main>
   <article class="lead">
+    {% if lead.image %}<img src="{{ lead.image }}" alt="">{% endif %}
     <span class="kicker">{{ lead.category }}</span>
     <h2><a href="{{ lead.slug }}.html">{{ lead.title }}</a></h2>
-    <p class="excerpt">{{ lead.excerpt }}</p>
+    <p class="excerpt{% if not lead.image %} drop-cap{% endif %}">{{ lead.excerpt }}</p>
     <a class="readmore" href="{{ lead.slug }}.html">Weiterlesen →</a>
   </article>
 
-  <div class="teaser-grid">
-    {% for t in teasers %}
-    <article class="teaser">
-      <span class="kicker">{{ t.category }}</span>
-      <h3><a href="{{ t.slug }}.html">{{ t.title }}</a></h3>
-      <p class="excerpt">{{ t.excerpt }}</p>
-    </article>
-    {% endfor %}
-  </div>
+  {% for cat, arts in sections %}
+  <section class="rubrik-section">
+    <h2 class="rubrik-title">{{ cat }}</h2>
+    <div class="teaser-grid">
+      {% for t in arts %}
+      <article class="teaser">
+        {% if t.image %}<img src="{{ t.image }}" alt="">{% endif %}
+        <h3><a href="{{ t.slug }}.html">{{ t.title }}</a></h3>
+        <p class="excerpt">{{ t.excerpt }}</p>
+      </article>
+      {% endfor %}
+    </div>
+  </section>
+  {% endfor %}
 </main>
 
 <footer>
@@ -618,6 +735,8 @@ cat > "$STAGE/app/templates/article.html" <<'ZEITUNG_FILE_EOF'
     <div class="byline">{{ a.source }}{% if a.author %} · {{ a.author }}{% endif %} · <a href="{{ a.link }}">Original lesen</a></div>
   </div>
 
+  {% if a.image %}<img class="article-image" src="{{ a.image }}" alt="">{% endif %}
+
   <div class="article-body">
     {% for p in a.paragraphs %}
     <p>{{ p }}</p>
@@ -649,18 +768,20 @@ cat > "$STAGE/app/templates/print.html" <<'ZEITUNG_FILE_EOF'
   .masthead h1 { font-size: 30pt; font-weight: normal; margin: 0; }
   .masthead-sub { font-family: Arial, sans-serif; font-size: 9pt; text-transform: uppercase; letter-spacing: 1px; color: #555; }
   .kicker { display: block; font-family: Arial, sans-serif; font-size: 8pt; text-transform: uppercase; letter-spacing: 1px; color: #7a1f1f; margin-bottom: 4pt; }
-  .lead { border-bottom: 1pt solid #1a1a1a; padding-bottom: 14pt; margin-bottom: 14pt; }
+  .lead img { width: 100%; height: auto; margin-bottom: 8pt; }
   .lead h2 { font-size: 22pt; line-height: 1.15; margin: 0 0 6pt; }
-  .lead .excerpt { font-size: 12pt; color: #444; }
-  .front-grid { display: flex; flex-wrap: wrap; gap: 12pt; }
-  .front-grid .teaser { width: 47%; border-top: 1pt solid #1a1a1a; padding-top: 6pt; }
-  .front-grid .teaser h3 { font-size: 12pt; margin: 0 0 4pt; }
-  .front-grid .teaser .excerpt { font-size: 9.5pt; color: #444; }
-  .article-page { break-before: page; }
-  .article-header { border-bottom: 1pt solid #1a1a1a; padding-bottom: 8pt; margin-bottom: 12pt; }
-  .article-header h1 { font-size: 20pt; margin: 4pt 0; line-height: 1.15; }
-  .byline { font-family: Arial, sans-serif; font-size: 8pt; color: #555; }
-  .article-body { columns: 2; column-gap: 14pt; text-align: justify; }
+  .lead .article-body { margin-top: 8pt; }
+  .toc { margin-top: 18pt; border-top: 1pt solid #1a1a1a; padding-top: 8pt; font-family: Arial, sans-serif; font-size: 9.5pt; }
+  .toc-title { text-transform: uppercase; letter-spacing: 1px; color: #7a1f1f; margin-bottom: 4pt; }
+  .toc ul { margin: 0; padding-left: 16pt; columns: 2; }
+  .rubrik-page { break-before: page; }
+  .rubrik-title { font-size: 20pt; font-weight: normal; border-bottom: 3px double #1a1a1a; padding-bottom: 6pt; margin: 0 0 14pt; }
+  .article-block { margin-bottom: 18pt; }
+  .article-block + .article-block { border-top: 1pt solid #ccc; padding-top: 14pt; }
+  .article-block h3 { font-size: 15pt; margin: 0 0 4pt; }
+  .byline { font-family: Arial, sans-serif; font-size: 8pt; color: #555; margin-bottom: 6pt; }
+  .article-image { width: 100%; height: auto; margin-bottom: 8pt; }
+  .article-body { columns: 2; column-gap: 14pt; text-align: justify; font-size: 10.5pt; }
   .article-body p { margin: 0 0 8pt; }
 </style>
 </head>
@@ -671,33 +792,38 @@ cat > "$STAGE/app/templates/print.html" <<'ZEITUNG_FILE_EOF'
   </div>
 
   <div class="lead">
+    {% if lead.image %}<img src="{{ lead.image }}" alt="">{% endif %}
     <span class="kicker">{{ lead.category }}</span>
     <h2>{{ lead.title }}</h2>
-    <p class="excerpt">{{ lead.excerpt }}</p>
+    <div class="article-body">
+      {% for p in lead.paragraphs %}<p>{{ p }}</p>{% endfor %}
+    </div>
   </div>
 
-  <div class="front-grid">
-    {% for a in articles[1:] %}
-    <div class="teaser">
-      <span class="kicker">{{ a.category }}</span>
+  {% if sections %}
+  <div class="toc">
+    <div class="toc-title">In dieser Ausgabe</div>
+    <ul>
+      {% for cat, arts in sections %}
+      <li>{{ cat }} ({{ arts|length }})</li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+
+  {% for cat, arts in sections %}
+  <div class="rubrik-page">
+    <h2 class="rubrik-title">{{ cat }}</h2>
+    {% for a in arts %}
+    <div class="article-block">
       <h3>{{ a.title }}</h3>
-      <p class="excerpt">{{ a.excerpt }}</p>
+      <div class="byline">{{ a.source }}{% if a.author %} · {{ a.author }}{% endif %}</div>
+      {% if a.image %}<img class="article-image" src="{{ a.image }}" alt="">{% endif %}
+      <div class="article-body">
+        {% for p in a.paragraphs %}<p>{{ p }}</p>{% endfor %}
+      </div>
     </div>
     {% endfor %}
-  </div>
-
-  {% for a in articles %}
-  <div class="article-page">
-    <div class="article-header">
-      <span class="kicker">{{ a.category }}</span>
-      <h1>{{ a.title }}</h1>
-      {% if a.author %}<div class="byline">{{ a.source }} · {{ a.author }}</div>{% else %}<div class="byline">{{ a.source }}</div>{% endif %}
-    </div>
-    <div class="article-body">
-      {% for p in a.paragraphs %}
-      <p>{{ p }}</p>
-      {% endfor %}
-    </div>
   </div>
   {% endfor %}
 </body>
@@ -767,6 +893,14 @@ main {
   margin-bottom: 24px;
 }
 
+.lead img {
+  width: 100%;
+  max-height: 420px;
+  object-fit: cover;
+  display: block;
+  margin-bottom: 14px;
+}
+
 .lead h2 {
   font-size: clamp(26px, 4vw, 40px);
   margin: 0 0 10px;
@@ -783,7 +917,7 @@ main {
   font-size: 17px;
 }
 
-.lead .excerpt::first-letter {
+.excerpt.drop-cap::first-letter {
   float: left;
   font-size: 54px;
   line-height: 44px;
@@ -801,6 +935,18 @@ main {
   text-decoration: none;
 }
 
+.rubrik-section {
+  margin-top: 36px;
+}
+
+.rubrik-title {
+  font-size: 22px;
+  font-weight: 400;
+  border-bottom: 2px solid var(--rule);
+  padding-bottom: 6px;
+  margin: 0 0 16px;
+}
+
 .teaser-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
@@ -810,6 +956,13 @@ main {
 .teaser {
   border-top: 1px solid var(--rule);
   padding-top: 12px;
+}
+
+.teaser img {
+  width: 100%;
+  height: 140px;
+  object-fit: cover;
+  margin-bottom: 8px;
 }
 
 .teaser h3 {
@@ -851,6 +1004,12 @@ footer a { color: var(--ink-light); }
   font-family: Arial, sans-serif;
   font-size: 12px;
   color: var(--ink-light);
+}
+
+.article-image {
+  width: 100%;
+  height: auto;
+  margin-bottom: 20px;
 }
 
 .article-body {
