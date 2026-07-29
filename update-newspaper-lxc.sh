@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ============================================================
-#  Zeitungs-LXC Installer fuer Proxmox VE
-#  Erstellt einen LXC-Container, der aus RSS-Feeds automatisch
-#  eine taegliche "Zeitung" (Web-App + PDF) generiert.
+#  Zeitungs-LXC Update
+#  Spielt die aktuelle App-Version in einen bereits bestehenden
+#  Zeitungs-Container ein (Feeds/Ausgaben bleiben erhalten).
 #  Ausfuehren auf der Proxmox-Host-Shell:
-#    bash install-newspaper-lxc.sh
+#    bash update-newspaper-lxc.sh
 # ============================================================
 set -euo pipefail
 
@@ -17,69 +17,18 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-echo "=== Zeitungs-LXC Installer ==="
-echo ""
-
-DEFAULT_CTID=$(pvesh get /cluster/nextid)
-read -rp "Container-ID [$DEFAULT_CTID]: " CTID
-CTID=${CTID:-$DEFAULT_CTID}
-
-read -rp "Hostname [zeitung]: " CT_HOSTNAME
-CT_HOSTNAME=${CT_HOSTNAME:-zeitung}
-
-read -rp "Storage fuer Root-Disk [local-lvm]: " STORAGE
-STORAGE=${STORAGE:-local-lvm}
-
-read -rp "Netzwerk-Bridge [vmbr0]: " BRIDGE
-BRIDGE=${BRIDGE:-vmbr0}
-
-read -rp "RAM in MB [2048]: " RAM
-RAM=${RAM:-2048}
-
-read -rp "CPU-Kerne [2]: " CORES
-CORES=${CORES:-2}
-
-read -rp "Festplatte in GB [8]: " DISK
-DISK=${DISK:-8}
-
-echo ""
-echo "Aktualisiere Vorlagenliste..."
-pveam update >/dev/null 2>&1 || true
-TEMPLATE=$(pveam available --section system 2>/dev/null | grep -o 'debian-12[^ ]*\.tar\.zst' | sort -V | tail -n1)
-if [ -z "$TEMPLATE" ]; then
-  echo "Konnte kein Debian-12-Template finden. Bitte manuell pruefen mit: pveam available" >&2
+read -rp "Container-ID der bestehenden Zeitung: " CTID
+if [ -z "$CTID" ]; then
+  echo "Container-ID erforderlich." >&2
   exit 1
 fi
-if ! pveam list local 2>/dev/null | grep -q "$TEMPLATE"; then
-  echo "Lade Vorlage $TEMPLATE herunter..."
-  pveam download local "$TEMPLATE"
+if ! pct status "$CTID" >/dev/null 2>&1; then
+  echo "Container $CTID wurde nicht gefunden." >&2
+  exit 1
 fi
 
-echo "Erstelle Container $CTID ($CT_HOSTNAME)..."
-pct create "$CTID" "local:vztmpl/$TEMPLATE" \
-  --hostname "$CT_HOSTNAME" \
-  --cores "$CORES" \
-  --memory "$RAM" \
-  --swap 512 \
-  --rootfs "${STORAGE}:${DISK}" \
-  --net0 "name=eth0,bridge=${BRIDGE},ip=dhcp" \
-  --unprivileged 1 \
-  --features nesting=1 \
-  --onboot 1
-
-pct start "$CTID"
-
-echo "Warte auf Netzwerk..."
-IP=""
-for i in $(seq 1 30); do
-  IP=$(pct exec "$CTID" -- hostname -I 2>/dev/null | awk '{print $1}') || true
-  [ -n "$IP" ] && break
-  sleep 2
-done
-
-echo "Baue Anwendungspaket..."
 STAGE=$(mktemp -d)
-mkdir -p "$STAGE/app/templates" "$STAGE/app/static" "$STAGE/systemd"
+mkdir -p "$STAGE/app/templates" "$STAGE/app/static"
 
 cat > "$STAGE/app/main.py" <<'ZEITUNG_FILE_EOF'
 from pathlib import Path
@@ -308,6 +257,8 @@ TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 
 env = Environment(loader=FileSystemLoader(str(TEMPLATES_DIR)))
 
+PAPER_NAME = "LichtValleyZeitung"
+
 WEEKDAYS_DE = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
 MONTHS_DE = [
     "Januar", "Februar", "März", "April", "Mai", "Juni",
@@ -345,16 +296,6 @@ def feed_summary_html(entry) -> str:
     return entry.get("summary", "") or entry.get("description", "") or ""
 
 
-def feed_image(entry):
-    media = entry.get("media_content") or entry.get("media_thumbnail")
-    if media and media[0].get("url"):
-        return media[0]["url"]
-    for link in entry.get("links", []):
-        if str(link.get("type", "")).startswith("image/") and link.get("href"):
-            return link["href"]
-    return None
-
-
 def fetch_candidates(feeds, max_per_feed=6):
     """feeds: list of dicts with url/name/category"""
     candidates = []
@@ -381,7 +322,6 @@ def fetch_candidates(feeds, max_per_feed=6):
                     "source": feed_title,
                     "published": entry.get("published", ""),
                     "fallback_html": feed_summary_html(entry),
-                    "fallback_image": feed_image(entry),
                 }
             )
     print(f"{len(candidates)} Artikel-Kandidaten aus {len(feeds)} Feed(s) gefunden.")
@@ -390,7 +330,6 @@ def fetch_candidates(feeds, max_per_feed=6):
 
 def extract_article(candidate, min_chars=200):
     paragraphs = []
-    image = candidate.get("fallback_image")
     title = candidate["title"]
     author = None
 
@@ -405,7 +344,6 @@ def extract_article(candidate, min_chars=200):
                 downloaded,
                 output_format="json",
                 with_metadata=True,
-                include_images=True,
                 favor_precision=True,
             )
         except Exception:
@@ -419,7 +357,6 @@ def extract_article(candidate, min_chars=200):
             if len(text) >= min_chars:
                 paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
                 title = data.get("title") or title
-                image = data.get("image") or image
                 author = data.get("author")
 
     if not paragraphs and candidate.get("fallback_html"):
@@ -434,23 +371,18 @@ def extract_article(candidate, min_chars=200):
         return None
 
     excerpt = paragraphs[0][:220]
-    clean = {k: v for k, v in candidate.items() if k not in ("fallback_html", "fallback_image")}
+    clean = {k: v for k, v in candidate.items() if k != "fallback_html"}
     return {
         **clean,
         "title": title,
         "excerpt": excerpt,
-        "image": image,
         "paragraphs": paragraphs,
         "author": author,
     }
 
 
 def score_article(article):
-    s = 0.0
-    if article.get("image"):
-        s += 3.0
-    s += min(len(article.get("paragraphs", [])), 12) * 0.5
-    return s
+    return min(len(article.get("paragraphs", [])), 12)
 
 
 def build_edition(feeds, max_articles=10, max_candidates=40):
@@ -483,19 +415,28 @@ def build_edition(feeds, max_articles=10, max_candidates=40):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     front_html = env.get_template("front_page.html").render(
-        date_display=date_display, lead=lead, teasers=teasers
+        paper_name=PAPER_NAME, date_display=date_display, lead=lead, teasers=teasers
     )
     (out_dir / "index.html").write_text(front_html, encoding="utf-8")
 
     art_tpl = env.get_template("article.html")
+    total = len(articles)
     for i, a in enumerate(articles):
         prev_link = articles[i - 1]["slug"] + ".html" if i > 0 else "index.html"
         next_link = articles[i + 1]["slug"] + ".html" if i < len(articles) - 1 else "index.html"
-        html = art_tpl.render(a=a, prev_link=prev_link, next_link=next_link, date_display=date_display)
+        html = art_tpl.render(
+            paper_name=PAPER_NAME,
+            a=a,
+            prev_link=prev_link,
+            next_link=next_link,
+            date_display=date_display,
+            page_num=i + 1,
+            total_pages=total,
+        )
         (out_dir / f"{a['slug']}.html").write_text(html, encoding="utf-8")
 
     print_html = env.get_template("print.html").render(
-        date_display=date_display, lead=lead, articles=articles
+        paper_name=PAPER_NAME, date_display=date_display, lead=lead, articles=articles
     )
     pdf_path = out_dir / "zeitung.pdf"
     try:
@@ -547,12 +488,12 @@ cat > "$STAGE/app/templates/admin.html" <<'ZEITUNG_FILE_EOF'
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Zeitungs-Verwaltung</title>
+<title>LichtValleyZeitung – Verwaltung</title>
 <link rel="stylesheet" href="/static/admin.css">
 </head>
 <body>
 <div class="wrap">
-  <h1>Zeitungs-Verwaltung</h1>
+  <h1>LichtValleyZeitung <span class="admin-tag">Verwaltung</span></h1>
   <div class="status">
     {% if last_status %}<p class="status-msg">{{ last_status }}</p>{% endif %}
     {% if has_edition %}
@@ -619,18 +560,17 @@ cat > "$STAGE/app/templates/front_page.html" <<'ZEITUNG_FILE_EOF'
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Die Tageszeitung – {{ date_display }}</title>
+<title>{{ paper_name }} – {{ date_display }}</title>
 <link rel="stylesheet" href="/static/style.css">
 </head>
-<body>
+<body data-next="{{ lead.slug }}.html">
 <header class="masthead">
-  <h1>Die Tageszeitung</h1>
+  <h1>{{ paper_name }}</h1>
   <div class="masthead-sub">{{ date_display }} · automatisch erstellte Ausgabe</div>
 </header>
 
 <main>
   <article class="lead">
-    {% if lead.image %}<img src="{{ lead.image }}" alt="">{% endif %}
     <span class="kicker">{{ lead.category }}</span>
     <h2><a href="{{ lead.slug }}.html">{{ lead.title }}</a></h2>
     <p class="excerpt">{{ lead.excerpt }}</p>
@@ -640,7 +580,6 @@ cat > "$STAGE/app/templates/front_page.html" <<'ZEITUNG_FILE_EOF'
   <div class="teaser-grid">
     {% for t in teasers %}
     <article class="teaser">
-      {% if t.image %}<img src="{{ t.image }}" alt="">{% endif %}
       <span class="kicker">{{ t.category }}</span>
       <h3><a href="{{ t.slug }}.html">{{ t.title }}</a></h3>
       <p class="excerpt">{{ t.excerpt }}</p>
@@ -651,7 +590,9 @@ cat > "$STAGE/app/templates/front_page.html" <<'ZEITUNG_FILE_EOF'
 
 <footer>
   <a href="/">Zur Verwaltung</a> · <a href="zeitung.pdf">PDF-Ausgabe</a>
+  <p class="swipe-hint">← Zum Lesen nach links wischen</p>
 </footer>
+<script src="/static/swipe.js" defer></script>
 </body>
 </html>
 ZEITUNG_FILE_EOF
@@ -664,9 +605,9 @@ cat > "$STAGE/app/templates/article.html" <<'ZEITUNG_FILE_EOF'
 <title>{{ a.title }}</title>
 <link rel="stylesheet" href="/static/style.css">
 </head>
-<body>
+<body data-next="{{ next_link }}" data-prev="{{ prev_link }}">
 <header class="masthead">
-  <h1><a href="index.html">Die Tageszeitung</a></h1>
+  <h1><a href="index.html">{{ paper_name }}</a></h1>
   <div class="masthead-sub">{{ date_display }}</div>
 </header>
 
@@ -677,8 +618,6 @@ cat > "$STAGE/app/templates/article.html" <<'ZEITUNG_FILE_EOF'
     <div class="byline">{{ a.source }}{% if a.author %} · {{ a.author }}{% endif %} · <a href="{{ a.link }}">Original lesen</a></div>
   </div>
 
-  {% if a.image %}<img class="article-image" src="{{ a.image }}" alt="">{% endif %}
-
   <div class="article-body">
     {% for p in a.paragraphs %}
     <p>{{ p }}</p>
@@ -687,10 +626,12 @@ cat > "$STAGE/app/templates/article.html" <<'ZEITUNG_FILE_EOF'
 
   <div class="article-nav">
     <a href="{{ prev_link }}">← Zurück</a>
-    <a href="index.html">Titelseite</a>
+    <span class="page-indicator">Seite {{ page_num }} / {{ total_pages }}</span>
     <a href="{{ next_link }}">Weiter →</a>
   </div>
+  <p class="swipe-hint">Wischen zum Blättern</p>
 </main>
+<script src="/static/swipe.js" defer></script>
 </body>
 </html>
 ZEITUNG_FILE_EOF
@@ -699,7 +640,7 @@ cat > "$STAGE/app/templates/print.html" <<'ZEITUNG_FILE_EOF'
 <html lang="de">
 <head>
 <meta charset="utf-8">
-<title>Die Tageszeitung – {{ date_display }}</title>
+<title>{{ paper_name }} – {{ date_display }}</title>
 <style>
   @page { size: A4; margin: 18mm 16mm; }
   * { box-sizing: border-box; }
@@ -709,7 +650,6 @@ cat > "$STAGE/app/templates/print.html" <<'ZEITUNG_FILE_EOF'
   .masthead-sub { font-family: Arial, sans-serif; font-size: 9pt; text-transform: uppercase; letter-spacing: 1px; color: #555; }
   .kicker { display: block; font-family: Arial, sans-serif; font-size: 8pt; text-transform: uppercase; letter-spacing: 1px; color: #7a1f1f; margin-bottom: 4pt; }
   .lead { border-bottom: 1pt solid #1a1a1a; padding-bottom: 14pt; margin-bottom: 14pt; }
-  .lead img { width: 100%; height: auto; margin-bottom: 8pt; }
   .lead h2 { font-size: 22pt; line-height: 1.15; margin: 0 0 6pt; }
   .lead .excerpt { font-size: 12pt; color: #444; }
   .front-grid { display: flex; flex-wrap: wrap; gap: 12pt; }
@@ -720,19 +660,17 @@ cat > "$STAGE/app/templates/print.html" <<'ZEITUNG_FILE_EOF'
   .article-header { border-bottom: 1pt solid #1a1a1a; padding-bottom: 8pt; margin-bottom: 12pt; }
   .article-header h1 { font-size: 20pt; margin: 4pt 0; line-height: 1.15; }
   .byline { font-family: Arial, sans-serif; font-size: 8pt; color: #555; }
-  .article-image { width: 100%; height: auto; margin-bottom: 10pt; }
   .article-body { columns: 2; column-gap: 14pt; text-align: justify; }
   .article-body p { margin: 0 0 8pt; }
 </style>
 </head>
 <body>
   <div class="masthead">
-    <h1>Die Tageszeitung</h1>
+    <h1>{{ paper_name }}</h1>
     <div class="masthead-sub">{{ date_display }} · automatisch erstellte Ausgabe</div>
   </div>
 
   <div class="lead">
-    {% if lead.image %}<img src="{{ lead.image }}" alt="">{% endif %}
     <span class="kicker">{{ lead.category }}</span>
     <h2>{{ lead.title }}</h2>
     <p class="excerpt">{{ lead.excerpt }}</p>
@@ -753,9 +691,8 @@ cat > "$STAGE/app/templates/print.html" <<'ZEITUNG_FILE_EOF'
     <div class="article-header">
       <span class="kicker">{{ a.category }}</span>
       <h1>{{ a.title }}</h1>
-      <div class="byline">{{ a.source }}{% if a.author %} · {{ a.author }}{% endif %}</div>
+      {% if a.author %}<div class="byline">{{ a.source }} · {{ a.author }}</div>{% else %}<div class="byline">{{ a.source }}</div>{% endif %}
     </div>
-    {% if a.image %}<img class="article-image" src="{{ a.image }}" alt="">{% endif %}
     <div class="article-body">
       {% for p in a.paragraphs %}
       <p>{{ p }}</p>
@@ -830,13 +767,6 @@ main {
   margin-bottom: 24px;
 }
 
-.lead img {
-  width: 100%;
-  height: auto;
-  display: block;
-  margin-bottom: 14px;
-}
-
 .lead h2 {
   font-size: clamp(26px, 4vw, 40px);
   margin: 0 0 10px;
@@ -851,6 +781,15 @@ main {
 .excerpt {
   color: var(--ink-light);
   font-size: 17px;
+}
+
+.lead .excerpt::first-letter {
+  float: left;
+  font-size: 54px;
+  line-height: 44px;
+  padding: 4px 8px 0 0;
+  font-weight: 400;
+  color: var(--ink);
 }
 
 .readmore {
@@ -871,13 +810,6 @@ main {
 .teaser {
   border-top: 1px solid var(--rule);
   padding-top: 12px;
-}
-
-.teaser img {
-  width: 100%;
-  height: 140px;
-  object-fit: cover;
-  margin-bottom: 8px;
 }
 
 .teaser h3 {
@@ -921,12 +853,6 @@ footer a { color: var(--ink-light); }
   color: var(--ink-light);
 }
 
-.article-image {
-  width: 100%;
-  height: auto;
-  margin-bottom: 20px;
-}
-
 .article-body {
   font-size: 18px;
   columns: 1;
@@ -941,6 +867,7 @@ footer a { color: var(--ink-light); }
 .article-nav {
   display: flex;
   justify-content: space-between;
+  align-items: center;
   font-family: Arial, sans-serif;
   font-size: 13px;
   margin-top: 30px;
@@ -949,6 +876,19 @@ footer a { color: var(--ink-light); }
 }
 
 .article-nav a { color: var(--accent); text-decoration: none; }
+
+.page-indicator {
+  color: var(--ink-light);
+  font-variant-numeric: tabular-nums;
+}
+
+.swipe-hint {
+  text-align: center;
+  font-family: Arial, sans-serif;
+  font-size: 12px;
+  color: #999;
+  margin-top: 14px;
+}
 ZEITUNG_FILE_EOF
 cat > "$STAGE/app/static/admin.css" <<'ZEITUNG_FILE_EOF'
 :root { --ink:#1a1a1a; --border:#ddd; --accent:#7a1f1f; --bg:#f4f3ef; }
@@ -962,6 +902,14 @@ body {
 }
 .wrap { max-width: 760px; margin: 0 auto; }
 h1 { font-size: 24px; margin-bottom: 4px; }
+.admin-tag {
+  font-size: 13px;
+  font-weight: normal;
+  color: #888;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  vertical-align: middle;
+}
 h2 { font-size: 16px; margin-top: 32px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
 .status { font-size: 14px; color: #555; margin-bottom: 20px; }
 .status a { color: var(--accent); }
@@ -1065,86 +1013,62 @@ button.del {
   font-size: 13px;
 }
 ZEITUNG_FILE_EOF
-cat > "$STAGE/systemd/zeitung-web.service" <<'ZEITUNG_FILE_EOF'
-[Unit]
-Description=Zeitung Web-App (Feed-Verwaltung + Auslieferung)
-After=network.target
+cat > "$STAGE/app/static/swipe.js" <<'ZEITUNG_FILE_EOF'
+(function () {
+  var THRESHOLD = 60;
+  var startX = 0;
+  var startY = 0;
 
-[Service]
-Type=simple
-WorkingDirectory=/opt/zeitung/app
-ExecStart=/opt/zeitung/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8080
-Restart=always
-RestartSec=3
+  document.addEventListener(
+    "touchstart",
+    function (e) {
+      startX = e.touches[0].clientX;
+      startY = e.touches[0].clientY;
+    },
+    { passive: true }
+  );
 
-[Install]
-WantedBy=multi-user.target
-ZEITUNG_FILE_EOF
-cat > "$STAGE/systemd/zeitung-generate.service" <<'ZEITUNG_FILE_EOF'
-[Unit]
-Description=Erstellt die taegliche Zeitungsausgabe aus den aktiven RSS-Feeds
+  document.addEventListener(
+    "touchend",
+    function (e) {
+      var dx = e.changedTouches[0].clientX - startX;
+      var dy = e.changedTouches[0].clientY - startY;
+      if (Math.abs(dx) < THRESHOLD || Math.abs(dx) < Math.abs(dy) * 1.5) return;
 
-[Service]
-Type=oneshot
-WorkingDirectory=/opt/zeitung/app
-ExecStart=/opt/zeitung/venv/bin/python /opt/zeitung/app/run_generate.py
-ZEITUNG_FILE_EOF
-cat > "$STAGE/systemd/zeitung-generate.timer" <<'ZEITUNG_FILE_EOF'
-[Unit]
-Description=Taegliche Zeitungserstellung um 05:30 Uhr
+      var body = document.body;
+      var target = dx < 0 ? body.getAttribute("data-next") : body.getAttribute("data-prev");
+      if (target) window.location.href = target;
+    },
+    { passive: true }
+  );
 
-[Timer]
-OnCalendar=*-*-* 05:30:00
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-ZEITUNG_FILE_EOF
-cat > "$STAGE/container-install.sh" <<'ZEITUNG_FILE_EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-echo "[1/4] Installiere Systempakete..."
-apt-get update -y
-DEBIAN_FRONTEND=noninteractive apt-get install -y \
-  python3 python3-venv python3-pip python3-dev build-essential \
-  libpango-1.0-0 libpangoft2-1.0-0 libpangocairo-1.0-0 libcairo2 \
-  libgdk-pixbuf-2.0-0 libffi-dev shared-mime-info fonts-dejavu-core fonts-liberation2 >/dev/null
-
-echo "[2/4] Erstelle Python-Umgebung..."
-python3 -m venv /opt/zeitung/venv
-/opt/zeitung/venv/bin/pip install --upgrade pip -q
-/opt/zeitung/venv/bin/pip install -q -r /opt/zeitung/app/requirements.txt
-
-mkdir -p /opt/zeitung/data /opt/zeitung/output
-
-echo "[3/4] Richte systemd-Dienste ein..."
-cp /opt/zeitung/systemd/zeitung-web.service /etc/systemd/system/
-cp /opt/zeitung/systemd/zeitung-generate.service /etc/systemd/system/
-cp /opt/zeitung/systemd/zeitung-generate.timer /etc/systemd/system/
-systemctl daemon-reload
-systemctl enable --now zeitung-web.service
-systemctl enable --now zeitung-generate.timer
-
-echo "[4/4] Fertig."
-IP=$(hostname -I | awk '{print $1}')
-echo ""
-echo "Zeitungs-Verwaltung erreichbar unter: http://$IP:8080"
-echo "Dort RSS-Feeds eintragen/anhaken - die erste Ausgabe kannst du sofort"
-echo "per Knopfdruck erstellen. Danach laeuft es taeglich um 05:30 Uhr automatisch."
+  // Pfeiltasten fuers Testen am Desktop
+  document.addEventListener("keydown", function (e) {
+    var body = document.body;
+    if (e.key === "ArrowLeft") {
+      var prev = body.getAttribute("data-prev");
+      if (prev) window.location.href = prev;
+    } else if (e.key === "ArrowRight") {
+      var next = body.getAttribute("data-next");
+      if (next) window.location.href = next;
+    }
+  });
+})();
 ZEITUNG_FILE_EOF
 
-tar czf "$STAGE/zeitung-src.tar.gz" -C "$STAGE" app systemd container-install.sh
+tar czf "$STAGE/zeitung-update.tar.gz" -C "$STAGE" app
 
-echo "Uebertrage Dateien in den Container..."
-pct push "$CTID" "$STAGE/zeitung-src.tar.gz" /root/zeitung-src.tar.gz
+echo "Uebertrage aktualisierte Dateien in Container $CTID..."
+pct push "$CTID" "$STAGE/zeitung-update.tar.gz" /root/zeitung-update.tar.gz
 
-pct exec "$CTID" -- bash -c "mkdir -p /opt/zeitung && tar xzf /root/zeitung-src.tar.gz -C /opt/zeitung && bash /opt/zeitung/container-install.sh"
+pct exec "$CTID" -- bash -c "
+  tar xzf /root/zeitung-update.tar.gz -C /opt/zeitung &&
+  /opt/zeitung/venv/bin/pip install -q -r /opt/zeitung/app/requirements.txt &&
+  systemctl restart zeitung-web.service
+"
 
 rm -rf "$STAGE"
 
 echo ""
-echo "================================================"
-echo " Fertig!"
-echo " Zeitungs-Verwaltung: http://${IP:-<IP-des-Containers>}:8080"
-echo "================================================"
+echo "Update eingespielt und Web-Dienst neu gestartet."
+echo "Feeds und bisherige Ausgaben blieben erhalten."
