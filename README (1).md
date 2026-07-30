@@ -11,7 +11,7 @@ Auf der Proxmox-Host-Shell (z.B. über die Weboberfläche → Datacenter → dei
 Node → Shell):
 
 ```bash
-bash install-newspaper-lxc.sh
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/proxmox-zeitung/main/install-newspaper-lxc.sh)"
 ```
 
 Das Skript fragt nach Container-ID, Hostname, Storage, Netzwerk-Bridge,
