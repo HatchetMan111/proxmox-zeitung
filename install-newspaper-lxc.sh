@@ -99,23 +99,47 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 app = FastAPI(title="Zeitung")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
-app.mount("/zeitung", StaticFiles(directory=str(OUTPUT_DIR), html=True), name="zeitung")
 
 db.init_db()
+
+
+def has_edition() -> bool:
+    return (OUTPUT_DIR / "latest").exists()
 
 
 @app.get("/", response_class=HTMLResponse)
 def admin(request: Request):
     feeds = db.list_feeds()
-    last_run = db.get_setting("last_run")
+    last_status = db.get_setting("last_status")
     return templates.TemplateResponse(
-        request, "admin.html", {"feeds": feeds, "last_run": last_run}
+        request,
+        "admin.html",
+        {"feeds": feeds, "last_status": last_status, "has_edition": has_edition()},
     )
 
 
 @app.post("/feeds/add")
 def feeds_add(url: str = Form(...), name: str = Form(""), category: str = Form("Allgemein")):
     db.add_feed(url.strip(), name.strip(), category.strip() or "Allgemein")
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/feeds/bulk")
+def feeds_bulk(feeds_text: str = Form(...)):
+    added = 0
+    for line in feeds_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        url = parts[0]
+        if not url:
+            continue
+        name = parts[1] if len(parts) > 1 else ""
+        category = parts[2] if len(parts) > 2 else "Allgemein"
+        db.add_feed(url, name, category or "Allgemein")
+        added += 1
+    db.set_setting("last_status", f"{added} Feed(s) importiert.")
     return RedirectResponse("/", status_code=303)
 
 
@@ -134,10 +158,44 @@ def feeds_delete(feed_id: int):
 @app.post("/generate")
 def generate_now():
     feeds = [dict(f) for f in db.enabled_feeds()]
+    if not feeds:
+        db.set_setting("last_status", "Keine aktiven Feeds - bitte zuerst einen Feed hinzufügen und anhaken.")
+        return RedirectResponse("/", status_code=303)
+
     result = generator.build_edition(feeds)
     if result:
         db.set_setting("last_run", result["date"])
+        db.set_setting(
+            "last_status",
+            f"Ausgabe vom {result['date']} mit {result['article_count']} Artikel(n) "
+            f"in {result['section_count']} Rubriken erstellt.",
+        )
+    else:
+        db.set_setting(
+            "last_status",
+            "Es konnte kein Artikel aus den aktiven Feeds geladen werden. "
+            "Prüfe, ob die Feed-URLs korrekt sind und erreichbar sind (siehe journalctl -u zeitung-web -f).",
+        )
     return RedirectResponse("/", status_code=303)
+
+
+@app.get("/lesen")
+def lesen():
+    """Kurze, gut merkbare Lese-URL fürs Tablet - unabhängig von der Verwaltungsseite."""
+    if not has_edition():
+        return RedirectResponse("/", status_code=303)
+    return RedirectResponse("/zeitung/latest/", status_code=307)
+
+
+@app.get("/lesen.pdf")
+def lesen_pdf():
+    if not has_edition():
+        return RedirectResponse("/", status_code=303)
+    return RedirectResponse("/zeitung/latest/zeitung.pdf", status_code=307)
+
+
+# Erst NACH den eigenen Routen mounten, damit /lesen nicht vom StaticFiles-Mount verschluckt wird.
+app.mount("/zeitung", StaticFiles(directory=str(OUTPUT_DIR), html=True), name="zeitung")
 ZEITUNG_FILE_EOF
 cat > "$STAGE/app/db.py" <<'ZEITUNG_FILE_EOF'
 import sqlite3
@@ -235,9 +293,14 @@ def set_setting(key, value):
     conn.close()
 ZEITUNG_FILE_EOF
 cat > "$STAGE/app/generator.py" <<'ZEITUNG_FILE_EOF'
+import html as html_module
 import json
 import re
+import urllib.request
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 
 import feedparser
@@ -250,11 +313,18 @@ TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 
 env = Environment(loader=FileSystemLoader(str(TEMPLATES_DIR)))
 
+PAPER_NAME = "LichtValleyZeitung"
+
 WEEKDAYS_DE = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
 MONTHS_DE = [
     "Januar", "Februar", "März", "April", "Mai", "Juni",
     "Juli", "August", "September", "Oktober", "November", "Dezember",
 ]
+
+IMAGE_MAX_BYTES = 6 * 1024 * 1024
+IMAGE_MAX_WIDTH = 1000
+IMAGE_TIMEOUT = 8
+USER_AGENT = "Mozilla/5.0 (compatible; LichtValleyZeitung/1.0; +https://example.invalid)"
 
 
 def format_date_de(dt: datetime) -> str:
@@ -273,15 +343,52 @@ def slugify(text: str, maxlen: int = 60) -> str:
     return text[:maxlen] or "artikel"
 
 
-def fetch_candidates(feeds, max_per_feed=6):
+def strip_html(raw_html: str) -> str:
+    """Grobe Fallback-Bereinigung, falls trafilatura ein kurzes Snippet nicht mag."""
+    text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", raw_html, flags=re.S | re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html_module.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+URL_RE = re.compile(r"https?://\S+")
+
+
+def clean_paragraph(text: str) -> str:
+    """Entfernt nackte Links aus Fliesstext (z.B. Bildquellen-URLs, die manche
+    Feeds/Seiten als sichtbaren Text statt als Tag-Attribut liefern)."""
+    text = URL_RE.sub("", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def feed_summary_html(entry) -> str:
+    if entry.get("content"):
+        return entry["content"][0].get("value", "") or ""
+    return entry.get("summary", "") or entry.get("description", "") or ""
+
+
+def feed_image(entry):
+    media = entry.get("media_content") or entry.get("media_thumbnail")
+    if media and media[0].get("url"):
+        return media[0]["url"]
+    for link in entry.get("links", []):
+        if str(link.get("type", "")).startswith("image/") and link.get("href"):
+            return link["href"]
+    return None
+
+
+def fetch_candidates(feeds, max_per_feed=8):
     """feeds: list of dicts with url/name/category"""
     candidates = []
     seen_links = set()
     for feed in feeds:
         try:
             parsed = feedparser.parse(feed["url"])
-        except Exception:
+        except Exception as e:
+            print(f"Feed nicht lesbar ({feed['url']}): {e}")
             continue
+        if getattr(parsed, "bozo", False) and not parsed.entries:
+            print(f"Feed liefert keine Einträge ({feed['url']}): {parsed.get('bozo_exception')}")
         feed_title = feed.get("name") or getattr(parsed.feed, "title", "") or feed["url"]
         for entry in parsed.entries[:max_per_feed]:
             link = entry.get("link")
@@ -295,88 +402,232 @@ def fetch_candidates(feeds, max_per_feed=6):
                     "category": feed.get("category") or "Allgemein",
                     "source": feed_title,
                     "published": entry.get("published", ""),
+                    "fallback_html": feed_summary_html(entry),
+                    "fallback_image": feed_image(entry),
                 }
             )
+    print(f"{len(candidates)} Artikel-Kandidaten aus {len(feeds)} Feed(s) gefunden.")
     return candidates
 
 
-def extract_article(candidate, min_chars=300):
-    downloaded = trafilatura.fetch_url(candidate["link"])
-    if not downloaded:
+def extract_article(candidate, min_chars=200):
+    paragraphs = []
+    image_url = candidate.get("fallback_image")
+    title = candidate["title"]
+    author = None
+
+    try:
+        downloaded = trafilatura.fetch_url(candidate["link"])
+    except Exception:
+        downloaded = None
+
+    if downloaded:
+        try:
+            result = trafilatura.extract(
+                downloaded,
+                output_format="json",
+                with_metadata=True,
+                include_images=True,
+                favor_precision=True,
+            )
+        except Exception:
+            result = None
+        if result:
+            try:
+                data = json.loads(result)
+            except (json.JSONDecodeError, TypeError):
+                data = {}
+            text = data.get("text") or ""
+            if len(text) >= min_chars:
+                paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
+                title = data.get("title") or title
+                author = data.get("author")
+                image_url = data.get("image") or image_url
+
+    if not paragraphs and candidate.get("fallback_html"):
+        # Volltext nicht erreichbar/blockiert (JS-Seite, Paywall, ...) - RSS-eigenen Text nutzen,
+        # damit der Artikel trotzdem als Teaser mit Link zum Original erscheint.
+        text = strip_html(candidate["fallback_html"])
+        if len(text) > 40:
+            paragraphs = [text]
+
+    if not paragraphs:
+        print(f"Kein nutzbarer Text für: {candidate['link']}")
         return None
-    result = trafilatura.extract(
-        downloaded,
-        output_format="json",
-        with_metadata=True,
-        include_images=True,
-        favor_precision=True,
-    )
-    if not result:
+
+    paragraphs = [clean_paragraph(p) for p in paragraphs]
+    paragraphs = [p for p in paragraphs if len(p) >= 15]
+
+    if not paragraphs:
+        print(f"Nach Bereinigung kein Text übrig für: {candidate['link']}")
         return None
-    data = json.loads(result)
-    text = data.get("text") or ""
-    if len(text) < min_chars:
-        return None
-    paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
-    excerpt_source = data.get("excerpt") or (paragraphs[0] if paragraphs else "")
+
+    excerpt = paragraphs[0][:220]
+    clean = {k: v for k, v in candidate.items() if k not in ("fallback_html", "fallback_image")}
     return {
-        **candidate,
-        "title": data.get("title") or candidate["title"],
-        "excerpt": excerpt_source[:220],
-        "image": data.get("image") or None,
+        **clean,
+        "title": title,
+        "excerpt": excerpt,
         "paragraphs": paragraphs,
-        "author": data.get("author"),
+        "author": author,
+        "image_url": image_url,
     }
 
 
 def score_article(article):
-    s = 0.0
-    if article.get("image"):
-        s += 3.0
-    s += min(len(article.get("paragraphs", [])), 12) * 0.5
-    return s
+    return min(len(article.get("paragraphs", [])), 12)
 
 
-def build_edition(feeds, max_articles=10, max_candidates=40):
-    candidates = fetch_candidates(feeds)[:max_candidates]
-    articles = []
-    for c in candidates:
-        art = extract_article(c)
-        if art:
-            articles.append(art)
-        if len(articles) >= max_articles:
-            break
-
-    if not articles:
+def download_image(url, out_dir, filename):
+    """Laedt ein Bild lokal herunter und speichert es normalisiert als JPEG.
+    Liefert einen relativen Pfad (z.B. 'images/artikel-1.jpg') oder None."""
+    if not url:
+        return None
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=IMAGE_TIMEOUT) as resp:
+            content_type = resp.headers.get("Content-Type", "")
+            if not content_type.startswith("image/"):
+                return None
+            raw = resp.read(IMAGE_MAX_BYTES + 1)
+            if len(raw) > IMAGE_MAX_BYTES:
+                return None
+    except Exception:
         return None
 
-    articles.sort(key=score_article, reverse=True)
-    lead = articles[0]
-    teasers = articles[1:]
+    try:
+        from PIL import Image
+
+        img = Image.open(BytesIO(raw))
+        img.load()
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        elif img.mode == "L":
+            img = img.convert("RGB")
+        if img.width > IMAGE_MAX_WIDTH:
+            ratio = IMAGE_MAX_WIDTH / float(img.width)
+            img = img.resize((IMAGE_MAX_WIDTH, max(1, int(img.height * ratio))))
+        images_dir = out_dir / "images"
+        images_dir.mkdir(exist_ok=True)
+        rel_path = f"images/{filename}.jpg"
+        img.save(images_dir / f"{filename}.jpg", "JPEG", quality=82)
+        return rel_path
+    except Exception:
+        return None
+
+
+def build_edition(feeds, per_category_cap=6, max_articles=40, max_candidates=80):
+    candidates = fetch_candidates(feeds)[:max_candidates]
+
+    extracted = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(extract_article, c) for c in candidates]
+        for fut in as_completed(futures):
+            art = fut.result()
+            if art:
+                extracted.append(art)
+
+    print(f"{len(extracted)} von {len(candidates)} Kandidaten als Artikel übernommen.")
+
+    if not extracted:
+        print("Keine Artikel verwertbar - keine Ausgabe erstellt.")
+        return None
+
+    # Bester Artikel insgesamt wird Aufmacher.
+    extracted.sort(key=score_article, reverse=True)
+    lead = extracted[0]
+
+    # Nach Rubrik gruppieren (jede Rubrik bekommt spaeter ihre eigene(n) Seite(n)),
+    # pro Rubrik gedeckelt, damit keine einzelne Rubrik die ganze Ausgabe dominiert.
+    by_category = OrderedDict()
+    for a in extracted:
+        by_category.setdefault(a["category"], []).append(a)
+
+    capped = []
+    for arts in by_category.values():
+        capped.extend(arts[:per_category_cap])
+    if len(capped) > max_articles:
+        capped.sort(key=score_article, reverse=True)
+        capped = capped[:max_articles]
+
+    # Finale Rubrik-Gruppen (alphabetisch, "Allgemein" ans Ende) und finale
+    # Artikel-Reihenfolge fuer Blaettern/Vor-Zurueck.
+    categories_sorted = sorted(
+        {a["category"] for a in capped},
+        key=lambda c: (c == "Allgemein", c.lower()),
+    )
+    sections_all = []
+    for cat in categories_sorted:
+        arts = sorted([a for a in capped if a["category"] == cat], key=score_article, reverse=True)
+        sections_all.append((cat, arts))
+
+    articles = [a for _, arts in sections_all for a in arts]
 
     for i, a in enumerate(articles):
         a["slug"] = f"artikel-{i + 1}-{slugify(a['title'])}"
 
+    # Rubrik-Sektionen ohne den bereits auf der Titelseite gezeigten Aufmacher,
+    # leere Rubriken (nur Aufmacher) werden uebersprungen.
+    sections = []
+    for cat, arts in sections_all:
+        rest = [a for a in arts if a["slug"] != lead["slug"]]
+        if rest:
+            sections.append((cat, rest))
+
     now = datetime.now()
     date_display = format_date_de(now)
+    time_display = now.strftime("%H:%M")
     edition_date = now.strftime("%Y-%m-%d")
     out_dir = OUTPUT_DIR / edition_date
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Sprungmarken fuer die Rubrik-Navigation: jede Rubrik zeigt auf ihren
+    # ersten (wichtigsten) Artikel - von dort aus fuehrt Weiterwischen durch
+    # die restlichen Artikel dieser Rubrik.
+    rubric_nav = [(cat, arts[0]["slug"] + ".html") for cat, arts in sections_all]
+
+    # Bilder parallel herunterladen und lokal ablegen.
+    def _fetch_image(a):
+        a["image"] = download_image(a.get("image_url"), out_dir, a["slug"])
+        a.pop("image_url", None)
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        list(pool.map(_fetch_image, articles))
+
     front_html = env.get_template("front_page.html").render(
-        date_display=date_display, lead=lead, teasers=teasers
+        paper_name=PAPER_NAME,
+        date_display=date_display,
+        time_display=time_display,
+        lead=lead,
+        sections=sections,
+        rubric_nav=rubric_nav,
     )
     (out_dir / "index.html").write_text(front_html, encoding="utf-8")
 
     art_tpl = env.get_template("article.html")
+    total = len(articles)
     for i, a in enumerate(articles):
         prev_link = articles[i - 1]["slug"] + ".html" if i > 0 else "index.html"
         next_link = articles[i + 1]["slug"] + ".html" if i < len(articles) - 1 else "index.html"
-        html = art_tpl.render(a=a, prev_link=prev_link, next_link=next_link, date_display=date_display)
+        html = art_tpl.render(
+            paper_name=PAPER_NAME,
+            a=a,
+            prev_link=prev_link,
+            next_link=next_link,
+            date_display=date_display,
+            time_display=time_display,
+            page_num=i + 1,
+            total_pages=total,
+            rubric_nav=rubric_nav,
+        )
         (out_dir / f"{a['slug']}.html").write_text(html, encoding="utf-8")
 
     print_html = env.get_template("print.html").render(
-        date_display=date_display, lead=lead, articles=articles
+        paper_name=PAPER_NAME,
+        date_display=date_display,
+        time_display=time_display,
+        lead=lead,
+        sections=sections,
     )
     pdf_path = out_dir / "zeitung.pdf"
     try:
@@ -391,7 +642,11 @@ def build_edition(feeds, max_articles=10, max_candidates=40):
         latest_link.unlink()
     latest_link.symlink_to(out_dir.name)
 
-    return {"date": edition_date, "article_count": len(articles)}
+    return {
+        "date": edition_date,
+        "article_count": len(articles),
+        "section_count": len(sections_all),
+    }
 ZEITUNG_FILE_EOF
 cat > "$STAGE/app/run_generate.py" <<'ZEITUNG_FILE_EOF'
 import sys
@@ -421,6 +676,7 @@ feedparser==6.0.12
 trafilatura==2.1.0
 weasyprint==69.0
 python-multipart==0.0.32
+Pillow==12.3.0
 ZEITUNG_FILE_EOF
 cat > "$STAGE/app/templates/admin.html" <<'ZEITUNG_FILE_EOF'
 <!DOCTYPE html>
@@ -428,23 +684,24 @@ cat > "$STAGE/app/templates/admin.html" <<'ZEITUNG_FILE_EOF'
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Zeitungs-Verwaltung</title>
+<title>LichtValleyZeitung – Verwaltung</title>
 <link rel="stylesheet" href="/static/admin.css">
 </head>
 <body>
 <div class="wrap">
-  <h1>Zeitungs-Verwaltung</h1>
+  <h1>LichtValleyZeitung <span class="admin-tag">Verwaltung</span></h1>
   <div class="status">
-    {% if last_run %}
-      Letzte Ausgabe: {{ last_run }} ·
-      <a href="/zeitung/latest/">Zeitung ansehen</a> ·
-      <a href="/zeitung/latest/zeitung.pdf">PDF herunterladen</a>
+    {% if last_status %}<p class="status-msg">{{ last_status }}</p>{% endif %}
+    {% if has_edition %}
+      <a href="/lesen">Zeitung ansehen</a> ·
+      <a href="/lesen.pdf">PDF herunterladen</a>
     {% else %}
-      Noch keine Ausgabe erstellt.
+      <p>Noch keine Ausgabe erstellt.</p>
     {% endif %}
+    <p class="tablet-hint">Fürs Tablet als Lesezeichen: <code>{{ request.base_url }}lesen</code></p>
   </div>
 
-  <form method="post" action="/generate" class="generate-form">
+  <form method="post" action="/generate" class="generate-form" onsubmit="this.querySelector('button').disabled=true; this.querySelector('button').textContent='Erstelle Ausgabe – das kann 1-2 Minuten dauern…';">
     <button type="submit">Zeitung jetzt erstellen</button>
   </form>
 
@@ -454,6 +711,12 @@ cat > "$STAGE/app/templates/admin.html" <<'ZEITUNG_FILE_EOF'
     <input type="text" name="name" placeholder="Name (optional)">
     <input type="text" name="category" placeholder="Rubrik (z.B. Politik)" value="Allgemein">
     <button type="submit">Hinzufügen</button>
+  </form>
+
+  <h2>Mehrere Feeds auf einmal importieren</h2>
+  <form method="post" action="/feeds/bulk" class="bulk-feed-form">
+    <textarea name="feeds_text" rows="6" placeholder="Eine URL pro Zeile. Optional mit Name und Rubrik: URL | Name | Rubrik"></textarea>
+    <button type="submit">Alle importieren</button>
   </form>
 
   <h2>Feeds ({{ feeds|length }})</h2>
@@ -493,39 +756,50 @@ cat > "$STAGE/app/templates/front_page.html" <<'ZEITUNG_FILE_EOF'
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Die Tageszeitung – {{ date_display }}</title>
+<title>{{ paper_name }} – {{ date_display }}</title>
 <link rel="stylesheet" href="/static/style.css">
 </head>
-<body>
+<body data-next="{{ lead.slug }}.html">
 <header class="masthead">
-  <h1>Die Tageszeitung</h1>
-  <div class="masthead-sub">{{ date_display }} · automatisch erstellte Ausgabe</div>
+  <h1>{{ paper_name }}</h1>
+  <div class="masthead-sub">{{ date_display }} · {{ time_display }} Uhr · automatisch erstellte Ausgabe</div>
 </header>
+{% if rubric_nav %}
+<nav class="rubrik-nav">
+  {% for cat, link in rubric_nav %}<a href="{{ link }}">{{ cat }}</a>{% endfor %}
+</nav>
+{% endif %}
 
 <main>
   <article class="lead">
     {% if lead.image %}<img src="{{ lead.image }}" alt="">{% endif %}
     <span class="kicker">{{ lead.category }}</span>
     <h2><a href="{{ lead.slug }}.html">{{ lead.title }}</a></h2>
-    <p class="excerpt">{{ lead.excerpt }}</p>
+    <p class="excerpt{% if not lead.image %} drop-cap{% endif %}">{{ lead.excerpt }}</p>
     <a class="readmore" href="{{ lead.slug }}.html">Weiterlesen →</a>
   </article>
 
-  <div class="teaser-grid">
-    {% for t in teasers %}
-    <article class="teaser">
-      {% if t.image %}<img src="{{ t.image }}" alt="">{% endif %}
-      <span class="kicker">{{ t.category }}</span>
-      <h3><a href="{{ t.slug }}.html">{{ t.title }}</a></h3>
-      <p class="excerpt">{{ t.excerpt }}</p>
-    </article>
-    {% endfor %}
-  </div>
+  {% for cat, arts in sections %}
+  <section class="rubrik-section">
+    <h2 class="rubrik-title">{{ cat }}</h2>
+    <div class="teaser-grid">
+      {% for t in arts %}
+      <article class="teaser">
+        {% if t.image %}<img src="{{ t.image }}" alt="">{% endif %}
+        <h3><a href="{{ t.slug }}.html">{{ t.title }}</a></h3>
+        <p class="excerpt">{{ t.excerpt }}</p>
+      </article>
+      {% endfor %}
+    </div>
+  </section>
+  {% endfor %}
 </main>
 
 <footer>
   <a href="/">Zur Verwaltung</a> · <a href="zeitung.pdf">PDF-Ausgabe</a>
+  <p class="swipe-hint">← Zum Lesen nach links wischen</p>
 </footer>
+<script src="/static/swipe.js" defer></script>
 </body>
 </html>
 ZEITUNG_FILE_EOF
@@ -538,11 +812,16 @@ cat > "$STAGE/app/templates/article.html" <<'ZEITUNG_FILE_EOF'
 <title>{{ a.title }}</title>
 <link rel="stylesheet" href="/static/style.css">
 </head>
-<body>
+<body data-next="{{ next_link }}" data-prev="{{ prev_link }}">
 <header class="masthead">
-  <h1><a href="index.html">Die Tageszeitung</a></h1>
-  <div class="masthead-sub">{{ date_display }}</div>
+  <h1><a href="index.html">{{ paper_name }}</a></h1>
+  <div class="masthead-sub">{{ date_display }} · {{ time_display }} Uhr</div>
 </header>
+{% if rubric_nav %}
+<nav class="rubrik-nav">
+  {% for cat, link in rubric_nav %}<a href="{{ link }}"{% if cat == a.category %} class="active"{% endif %}>{{ cat }}</a>{% endfor %}
+</nav>
+{% endif %}
 
 <main>
   <div class="article-header">
@@ -561,10 +840,12 @@ cat > "$STAGE/app/templates/article.html" <<'ZEITUNG_FILE_EOF'
 
   <div class="article-nav">
     <a href="{{ prev_link }}">← Zurück</a>
-    <a href="index.html">Titelseite</a>
+    <span class="page-indicator">Seite {{ page_num }} / {{ total_pages }}</span>
     <a href="{{ next_link }}">Weiter →</a>
   </div>
+  <p class="swipe-hint">Wischen zum Blättern</p>
 </main>
+<script src="/static/swipe.js" defer></script>
 </body>
 </html>
 ZEITUNG_FILE_EOF
@@ -573,7 +854,7 @@ cat > "$STAGE/app/templates/print.html" <<'ZEITUNG_FILE_EOF'
 <html lang="de">
 <head>
 <meta charset="utf-8">
-<title>Die Tageszeitung – {{ date_display }}</title>
+<title>{{ paper_name }} – {{ date_display }}</title>
 <style>
   @page { size: A4; margin: 18mm 16mm; }
   * { box-sizing: border-box; }
@@ -582,59 +863,62 @@ cat > "$STAGE/app/templates/print.html" <<'ZEITUNG_FILE_EOF'
   .masthead h1 { font-size: 30pt; font-weight: normal; margin: 0; }
   .masthead-sub { font-family: Arial, sans-serif; font-size: 9pt; text-transform: uppercase; letter-spacing: 1px; color: #555; }
   .kicker { display: block; font-family: Arial, sans-serif; font-size: 8pt; text-transform: uppercase; letter-spacing: 1px; color: #7a1f1f; margin-bottom: 4pt; }
-  .lead { border-bottom: 1pt solid #1a1a1a; padding-bottom: 14pt; margin-bottom: 14pt; }
   .lead img { width: 100%; height: auto; margin-bottom: 8pt; }
   .lead h2 { font-size: 22pt; line-height: 1.15; margin: 0 0 6pt; }
-  .lead .excerpt { font-size: 12pt; color: #444; }
-  .front-grid { display: flex; flex-wrap: wrap; gap: 12pt; }
-  .front-grid .teaser { width: 47%; border-top: 1pt solid #1a1a1a; padding-top: 6pt; }
-  .front-grid .teaser h3 { font-size: 12pt; margin: 0 0 4pt; }
-  .front-grid .teaser .excerpt { font-size: 9.5pt; color: #444; }
-  .article-page { break-before: page; }
-  .article-header { border-bottom: 1pt solid #1a1a1a; padding-bottom: 8pt; margin-bottom: 12pt; }
-  .article-header h1 { font-size: 20pt; margin: 4pt 0; line-height: 1.15; }
-  .byline { font-family: Arial, sans-serif; font-size: 8pt; color: #555; }
-  .article-image { width: 100%; height: auto; margin-bottom: 10pt; }
-  .article-body { columns: 2; column-gap: 14pt; text-align: justify; }
+  .lead .article-body { margin-top: 8pt; }
+  .toc { margin-top: 18pt; border-top: 1pt solid #1a1a1a; padding-top: 8pt; font-family: Arial, sans-serif; font-size: 9.5pt; }
+  .toc-title { text-transform: uppercase; letter-spacing: 1px; color: #7a1f1f; margin-bottom: 4pt; }
+  .toc ul { margin: 0; padding-left: 16pt; columns: 2; }
+  .rubrik-page { break-before: page; }
+  .rubrik-title { font-size: 20pt; font-weight: normal; border-bottom: 3px double #1a1a1a; padding-bottom: 6pt; margin: 0 0 14pt; }
+  .article-block { margin-bottom: 18pt; }
+  .article-block + .article-block { border-top: 1pt solid #ccc; padding-top: 14pt; }
+  .article-block h3 { font-size: 15pt; margin: 0 0 4pt; }
+  .byline { font-family: Arial, sans-serif; font-size: 8pt; color: #555; margin-bottom: 6pt; }
+  .article-image { width: 100%; height: auto; margin-bottom: 8pt; }
+  .article-body { columns: 2; column-gap: 14pt; text-align: justify; font-size: 10.5pt; }
   .article-body p { margin: 0 0 8pt; }
 </style>
 </head>
 <body>
   <div class="masthead">
-    <h1>Die Tageszeitung</h1>
-    <div class="masthead-sub">{{ date_display }} · automatisch erstellte Ausgabe</div>
+    <h1>{{ paper_name }}</h1>
+    <div class="masthead-sub">{{ date_display }} · {{ time_display }} Uhr · automatisch erstellte Ausgabe</div>
   </div>
 
   <div class="lead">
     {% if lead.image %}<img src="{{ lead.image }}" alt="">{% endif %}
     <span class="kicker">{{ lead.category }}</span>
     <h2>{{ lead.title }}</h2>
-    <p class="excerpt">{{ lead.excerpt }}</p>
+    <div class="article-body">
+      {% for p in lead.paragraphs %}<p>{{ p }}</p>{% endfor %}
+    </div>
   </div>
 
-  <div class="front-grid">
-    {% for a in articles[1:] %}
-    <div class="teaser">
-      <span class="kicker">{{ a.category }}</span>
+  {% if sections %}
+  <div class="toc">
+    <div class="toc-title">In dieser Ausgabe</div>
+    <ul>
+      {% for cat, arts in sections %}
+      <li>{{ cat }} ({{ arts|length }})</li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+
+  {% for cat, arts in sections %}
+  <div class="rubrik-page">
+    <h2 class="rubrik-title">{{ cat }}</h2>
+    {% for a in arts %}
+    <div class="article-block">
       <h3>{{ a.title }}</h3>
-      <p class="excerpt">{{ a.excerpt }}</p>
+      <div class="byline">{{ a.source }}{% if a.author %} · {{ a.author }}{% endif %}</div>
+      {% if a.image %}<img class="article-image" src="{{ a.image }}" alt="">{% endif %}
+      <div class="article-body">
+        {% for p in a.paragraphs %}<p>{{ p }}</p>{% endfor %}
+      </div>
     </div>
     {% endfor %}
-  </div>
-
-  {% for a in articles %}
-  <div class="article-page">
-    <div class="article-header">
-      <span class="kicker">{{ a.category }}</span>
-      <h1>{{ a.title }}</h1>
-      <div class="byline">{{ a.source }}{% if a.author %} · {{ a.author }}{% endif %}</div>
-    </div>
-    {% if a.image %}<img class="article-image" src="{{ a.image }}" alt="">{% endif %}
-    <div class="article-body">
-      {% for p in a.paragraphs %}
-      <p>{{ p }}</p>
-      {% endfor %}
-    </div>
   </div>
   {% endfor %}
 </body>
@@ -650,6 +934,11 @@ cat > "$STAGE/app/static/style.css" <<'ZEITUNG_FILE_EOF'
 }
 
 * { box-sizing: border-box; }
+
+html, body {
+  overflow-x: hidden;
+  max-width: 100%;
+}
 
 body {
   margin: 0;
@@ -681,6 +970,35 @@ body {
   letter-spacing: 1px;
 }
 
+.rubrik-nav {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--ink);
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 2px;
+  padding: 0 8px;
+}
+
+.rubrik-nav a {
+  color: #eee;
+  text-decoration: none;
+  font-family: Arial, sans-serif;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 10px 14px;
+  white-space: nowrap;
+}
+
+.rubrik-nav a:hover,
+.rubrik-nav a.active {
+  background: var(--accent);
+  color: #fff;
+}
+
 main {
   max-width: 920px;
   margin: 0 auto;
@@ -706,7 +1024,8 @@ main {
 
 .lead img {
   width: 100%;
-  height: auto;
+  max-height: 420px;
+  object-fit: cover;
   display: block;
   margin-bottom: 14px;
 }
@@ -725,6 +1044,17 @@ main {
 .excerpt {
   color: var(--ink-light);
   font-size: 17px;
+  overflow-wrap: break-word;
+  word-break: break-word;
+}
+
+.excerpt.drop-cap::first-letter {
+  float: left;
+  font-size: 54px;
+  line-height: 44px;
+  padding: 4px 8px 0 0;
+  font-weight: 400;
+  color: var(--ink);
 }
 
 .readmore {
@@ -734,6 +1064,18 @@ main {
   letter-spacing: 0.5px;
   color: var(--accent);
   text-decoration: none;
+}
+
+.rubrik-section {
+  margin-top: 36px;
+}
+
+.rubrik-title {
+  font-size: 22px;
+  font-weight: 400;
+  border-bottom: 2px solid var(--rule);
+  padding-bottom: 6px;
+  margin: 0 0 16px;
 }
 
 .teaser-grid {
@@ -806,7 +1148,7 @@ footer a { color: var(--ink-light); }
   columns: 1;
 }
 
-.article-body p { margin: 0 0 16px; }
+.article-body p { margin: 0 0 16px; overflow-wrap: break-word; word-break: break-word; }
 
 @media (min-width: 800px) {
   .article-body { columns: 2; column-gap: 32px; }
@@ -815,6 +1157,7 @@ footer a { color: var(--ink-light); }
 .article-nav {
   display: flex;
   justify-content: space-between;
+  align-items: center;
   font-family: Arial, sans-serif;
   font-size: 13px;
   margin-top: 30px;
@@ -823,6 +1166,19 @@ footer a { color: var(--ink-light); }
 }
 
 .article-nav a { color: var(--accent); text-decoration: none; }
+
+.page-indicator {
+  color: var(--ink-light);
+  font-variant-numeric: tabular-nums;
+}
+
+.swipe-hint {
+  text-align: center;
+  font-family: Arial, sans-serif;
+  font-size: 12px;
+  color: #999;
+  margin-top: 14px;
+}
 ZEITUNG_FILE_EOF
 cat > "$STAGE/app/static/admin.css" <<'ZEITUNG_FILE_EOF'
 :root { --ink:#1a1a1a; --border:#ddd; --accent:#7a1f1f; --bg:#f4f3ef; }
@@ -836,9 +1192,27 @@ body {
 }
 .wrap { max-width: 760px; margin: 0 auto; }
 h1 { font-size: 24px; margin-bottom: 4px; }
+.admin-tag {
+  font-size: 13px;
+  font-weight: normal;
+  color: #888;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  vertical-align: middle;
+}
 h2 { font-size: 16px; margin-top: 32px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
 .status { font-size: 14px; color: #555; margin-bottom: 20px; }
 .status a { color: var(--accent); }
+.status-msg {
+  background: #fff;
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  padding: 10px 12px;
+  border-radius: 4px;
+  margin: 0 0 8px;
+}
+.tablet-hint { font-size: 12px; color: #888; margin: 6px 0 0; }
+.tablet-hint code { background: #fff; padding: 2px 6px; border-radius: 4px; border: 1px solid var(--border); }
 .generate-form button {
   background: var(--accent);
   color: #fff;
@@ -862,6 +1236,28 @@ h2 { font-size: 16px; margin-top: 32px; border-bottom: 1px solid var(--border); 
   font-size: 14px;
 }
 .add-feed-form button {
+  padding: 10px 16px;
+  border: none;
+  background: var(--ink);
+  color: #fff;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.bulk-feed-form {
+  margin-top: 10px;
+}
+.bulk-feed-form textarea {
+  width: 100%;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 13px;
+  font-family: ui-monospace, monospace;
+  resize: vertical;
+  box-sizing: border-box;
+}
+.bulk-feed-form button {
+  margin-top: 8px;
   padding: 10px 16px;
   border: none;
   background: var(--ink);
@@ -906,6 +1302,48 @@ button.del {
   cursor: pointer;
   font-size: 13px;
 }
+ZEITUNG_FILE_EOF
+cat > "$STAGE/app/static/swipe.js" <<'ZEITUNG_FILE_EOF'
+(function () {
+  var THRESHOLD = 60;
+  var startX = 0;
+  var startY = 0;
+
+  document.addEventListener(
+    "touchstart",
+    function (e) {
+      startX = e.touches[0].clientX;
+      startY = e.touches[0].clientY;
+    },
+    { passive: true }
+  );
+
+  document.addEventListener(
+    "touchend",
+    function (e) {
+      var dx = e.changedTouches[0].clientX - startX;
+      var dy = e.changedTouches[0].clientY - startY;
+      if (Math.abs(dx) < THRESHOLD || Math.abs(dx) < Math.abs(dy) * 1.5) return;
+
+      var body = document.body;
+      var target = dx < 0 ? body.getAttribute("data-next") : body.getAttribute("data-prev");
+      if (target) window.location.href = target;
+    },
+    { passive: true }
+  );
+
+  // Pfeiltasten fuers Testen am Desktop
+  document.addEventListener("keydown", function (e) {
+    var body = document.body;
+    if (e.key === "ArrowLeft") {
+      var prev = body.getAttribute("data-prev");
+      if (prev) window.location.href = prev;
+    } else if (e.key === "ArrowRight") {
+      var next = body.getAttribute("data-next");
+      if (next) window.location.href = next;
+    }
+  });
+})();
 ZEITUNG_FILE_EOF
 cat > "$STAGE/systemd/zeitung-web.service" <<'ZEITUNG_FILE_EOF'
 [Unit]
