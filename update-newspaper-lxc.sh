@@ -300,6 +300,16 @@ def strip_html(raw_html: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+URL_RE = re.compile(r"https?://\S+")
+
+
+def clean_paragraph(text: str) -> str:
+    """Entfernt nackte Links aus Fliesstext (z.B. Bildquellen-URLs, die manche
+    Feeds/Seiten als sichtbaren Text statt als Tag-Attribut liefern)."""
+    text = URL_RE.sub("", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def feed_summary_html(entry) -> str:
     if entry.get("content"):
         return entry["content"][0].get("value", "") or ""
@@ -392,6 +402,13 @@ def extract_article(candidate, min_chars=200):
 
     if not paragraphs:
         print(f"Kein nutzbarer Text für: {candidate['link']}")
+        return None
+
+    paragraphs = [clean_paragraph(p) for p in paragraphs]
+    paragraphs = [p for p in paragraphs if len(p) >= 15]
+
+    if not paragraphs:
+        print(f"Nach Bereinigung kein Text übrig für: {candidate['link']}")
         return None
 
     excerpt = paragraphs[0][:220]
@@ -508,9 +525,15 @@ def build_edition(feeds, per_category_cap=6, max_articles=40, max_candidates=80)
 
     now = datetime.now()
     date_display = format_date_de(now)
+    time_display = now.strftime("%H:%M")
     edition_date = now.strftime("%Y-%m-%d")
     out_dir = OUTPUT_DIR / edition_date
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Sprungmarken fuer die Rubrik-Navigation: jede Rubrik zeigt auf ihren
+    # ersten (wichtigsten) Artikel - von dort aus fuehrt Weiterwischen durch
+    # die restlichen Artikel dieser Rubrik.
+    rubric_nav = [(cat, arts[0]["slug"] + ".html") for cat, arts in sections_all]
 
     # Bilder parallel herunterladen und lokal ablegen.
     def _fetch_image(a):
@@ -521,7 +544,12 @@ def build_edition(feeds, per_category_cap=6, max_articles=40, max_candidates=80)
         list(pool.map(_fetch_image, articles))
 
     front_html = env.get_template("front_page.html").render(
-        paper_name=PAPER_NAME, date_display=date_display, lead=lead, sections=sections
+        paper_name=PAPER_NAME,
+        date_display=date_display,
+        time_display=time_display,
+        lead=lead,
+        sections=sections,
+        rubric_nav=rubric_nav,
     )
     (out_dir / "index.html").write_text(front_html, encoding="utf-8")
 
@@ -536,13 +564,19 @@ def build_edition(feeds, per_category_cap=6, max_articles=40, max_candidates=80)
             prev_link=prev_link,
             next_link=next_link,
             date_display=date_display,
+            time_display=time_display,
             page_num=i + 1,
             total_pages=total,
+            rubric_nav=rubric_nav,
         )
         (out_dir / f"{a['slug']}.html").write_text(html, encoding="utf-8")
 
     print_html = env.get_template("print.html").render(
-        paper_name=PAPER_NAME, date_display=date_display, lead=lead, sections=sections
+        paper_name=PAPER_NAME,
+        date_display=date_display,
+        time_display=time_display,
+        lead=lead,
+        sections=sections,
     )
     pdf_path = out_dir / "zeitung.pdf"
     try:
@@ -677,8 +711,13 @@ cat > "$STAGE/app/templates/front_page.html" <<'ZEITUNG_FILE_EOF'
 <body data-next="{{ lead.slug }}.html">
 <header class="masthead">
   <h1>{{ paper_name }}</h1>
-  <div class="masthead-sub">{{ date_display }} · automatisch erstellte Ausgabe</div>
+  <div class="masthead-sub">{{ date_display }} · {{ time_display }} Uhr · automatisch erstellte Ausgabe</div>
 </header>
+{% if rubric_nav %}
+<nav class="rubrik-nav">
+  {% for cat, link in rubric_nav %}<a href="{{ link }}">{{ cat }}</a>{% endfor %}
+</nav>
+{% endif %}
 
 <main>
   <article class="lead">
@@ -725,8 +764,13 @@ cat > "$STAGE/app/templates/article.html" <<'ZEITUNG_FILE_EOF'
 <body data-next="{{ next_link }}" data-prev="{{ prev_link }}">
 <header class="masthead">
   <h1><a href="index.html">{{ paper_name }}</a></h1>
-  <div class="masthead-sub">{{ date_display }}</div>
+  <div class="masthead-sub">{{ date_display }} · {{ time_display }} Uhr</div>
 </header>
+{% if rubric_nav %}
+<nav class="rubrik-nav">
+  {% for cat, link in rubric_nav %}<a href="{{ link }}"{% if cat == a.category %} class="active"{% endif %}>{{ cat }}</a>{% endfor %}
+</nav>
+{% endif %}
 
 <main>
   <div class="article-header">
@@ -788,7 +832,7 @@ cat > "$STAGE/app/templates/print.html" <<'ZEITUNG_FILE_EOF'
 <body>
   <div class="masthead">
     <h1>{{ paper_name }}</h1>
-    <div class="masthead-sub">{{ date_display }} · automatisch erstellte Ausgabe</div>
+    <div class="masthead-sub">{{ date_display }} · {{ time_display }} Uhr · automatisch erstellte Ausgabe</div>
   </div>
 
   <div class="lead">
@@ -840,6 +884,11 @@ cat > "$STAGE/app/static/style.css" <<'ZEITUNG_FILE_EOF'
 
 * { box-sizing: border-box; }
 
+html, body {
+  overflow-x: hidden;
+  max-width: 100%;
+}
+
 body {
   margin: 0;
   background: #e9e7e1;
@@ -868,6 +917,35 @@ body {
   color: var(--ink-light);
   text-transform: uppercase;
   letter-spacing: 1px;
+}
+
+.rubrik-nav {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--ink);
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 2px;
+  padding: 0 8px;
+}
+
+.rubrik-nav a {
+  color: #eee;
+  text-decoration: none;
+  font-family: Arial, sans-serif;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 10px 14px;
+  white-space: nowrap;
+}
+
+.rubrik-nav a:hover,
+.rubrik-nav a.active {
+  background: var(--accent);
+  color: #fff;
 }
 
 main {
@@ -915,6 +993,8 @@ main {
 .excerpt {
   color: var(--ink-light);
   font-size: 17px;
+  overflow-wrap: break-word;
+  word-break: break-word;
 }
 
 .excerpt.drop-cap::first-letter {
@@ -1017,7 +1097,7 @@ footer a { color: var(--ink-light); }
   columns: 1;
 }
 
-.article-body p { margin: 0 0 16px; }
+.article-body p { margin: 0 0 16px; overflow-wrap: break-word; word-break: break-word; }
 
 @media (min-width: 800px) {
   .article-body { columns: 2; column-gap: 32px; }
