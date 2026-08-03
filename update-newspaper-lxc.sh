@@ -42,6 +42,7 @@ from fastapi.templating import Jinja2Templates
 import catalog
 import db
 import generator
+import local_news
 
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR.parent / "output"
@@ -151,6 +152,27 @@ async def feeds_catalog_add(request: Request):
         db.add_feed(url, name, cat, 1)
         added += 1
     db.set_setting("last_status", f"{added} Feed(s) aus dem Katalog hinzugefügt.")
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/feeds/local")
+def feeds_local(plz: str = Form(...)):
+    plz = plz.strip()
+    if not local_news.PLZ_RE.match(plz):
+        db.set_setting("last_status", "Bitte eine gültige 5-stellige PLZ eingeben.")
+        return RedirectResponse("/", status_code=303)
+
+    place = local_news.resolve_plz_de(plz)
+    if not place:
+        db.set_setting(
+            "last_status",
+            f"PLZ {plz} konnte nicht aufgelöst werden (Dienst nicht erreichbar oder PLZ unbekannt).",
+        )
+        return RedirectResponse("/", status_code=303)
+
+    url = local_news.local_news_feed_url(place)
+    db.add_feed(url, f"Lokal: {place} ({plz})", "Lokales", priority=2)
+    db.set_setting("last_status", f"Lokale Rubrik für {place} (PLZ {plz}) eingerichtet.")
     return RedirectResponse("/", status_code=303)
 
 
@@ -778,6 +800,41 @@ CURATED_FEEDS = {
     ],
 }
 ZEITUNG_FILE_EOF
+cat > "$STAGE/app/local_news.py" <<'ZEITUNG_FILE_EOF'
+import json
+import re
+import urllib.parse
+import urllib.request
+
+PLZ_RE = re.compile(r"^\d{5}$")
+USER_AGENT = "Mozilla/5.0 (compatible; LichtValleyZeitung/1.0)"
+TIMEOUT = 8
+
+
+def resolve_plz_de(plz: str):
+    """Loest eine deutsche Postleitzahl zu einem Ortsnamen auf.
+    Nutzt die freie zippopotam.us-API (kein API-Key noetig).
+    Gibt den Ortsnamen zurueck oder None, wenn nichts gefunden wurde."""
+    if not PLZ_RE.match(plz):
+        return None
+    url = f"https://api.zippopotam.us/de/{plz}"
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+    places = data.get("places") or []
+    if not places:
+        return None
+    return places[0].get("place name")
+
+
+def local_news_feed_url(place: str) -> str:
+    """Baut eine Google-News-RSS-Suche fuer einen Ortsnamen (deutschsprachig)."""
+    query = urllib.parse.quote(f'"{place}"')
+    return f"https://news.google.com/rss/search?q={query}&hl=de&gl=DE&ceid=DE:de"
+ZEITUNG_FILE_EOF
 cat > "$STAGE/app/run_generate.py" <<'ZEITUNG_FILE_EOF'
 import sys
 from pathlib import Path
@@ -851,6 +908,13 @@ cat > "$STAGE/app/templates/admin.html" <<'ZEITUNG_FILE_EOF'
   {% else %}
   <p class="hint">Sobald Feeds mit Rubriken angelegt sind, kannst du hier ihre Reihenfolge festlegen.</p>
   {% endif %}
+
+  <h2>Lokale Nachrichten</h2>
+  <p class="hint">PLZ eingeben, um automatisch eine "Lokales"-Rubrik für deinen Ort einzurichten.</p>
+  <form method="post" action="/feeds/local" class="local-form">
+    <input type="text" name="plz" placeholder="z.B. 97980" pattern="\d{5}" maxlength="5" required>
+    <button type="submit">Lokale Rubrik einrichten</button>
+  </form>
 
   <h2>Feed-Katalog</h2>
   <p class="hint">Geprüfte Feed-Vorschläge zum Anhaken – kein URL-Suchen nötig.</p>
@@ -1615,6 +1679,26 @@ h2 { font-size: 16px; margin-top: 32px; border-bottom: 1px solid var(--border); 
   cursor: pointer;
 }
 
+.local-form {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+.local-form input {
+  width: 120px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 14px;
+}
+.local-form button {
+  padding: 10px 16px;
+  border: none;
+  background: var(--accent);
+  color: #fff;
+  border-radius: 6px;
+  cursor: pointer;
+}
 .catalog-form { margin-top: 10px; }
 .catalog-group {
   border: 1px solid var(--border);
