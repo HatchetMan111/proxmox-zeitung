@@ -530,6 +530,7 @@ def fetch_candidates(feeds, max_per_feed=8):
                     "title": entry.get("title", "Ohne Titel"),
                     "category": feed.get("category") or "Allgemein",
                     "source": feed_title,
+                    "publisher": (entry.get("source") or {}).get("title"),
                     "feed_url": feed["url"],
                     "published": entry.get("published", ""),
                     "priority": feed.get("priority") or 1,
@@ -581,6 +582,17 @@ def extract_article(candidate, min_chars=200):
         text = strip_html(candidate["fallback_html"])
         if len(text) > 40:
             paragraphs = [text]
+
+    if not paragraphs and "news.google.com" in candidate["link"]:
+        # Google News liefert strukturell weder Volltext (nur Redirect-Links,
+        # die ohne JS oft ins Leere laufen) noch nutzbare Snippets im Feed
+        # selbst. Damit lokale/Google-News-Feeds nicht komplett leer bleiben,
+        # zumindest die Schlagzeile mit Link zur Quelle zeigen.
+        source = candidate.get("publisher") or candidate.get("source") or "Google News"
+        paragraphs = [
+            f"Kurzmeldung von {source}. Der vollständige Artikel ist über "
+            f"\"Original lesen\" oben erreichbar."
+        ]
 
     if not paragraphs:
         print(f"Kein nutzbarer Text für: {candidate['link']}")
@@ -884,11 +896,13 @@ def resolve_plz_de(plz: str):
 
 
 def local_news_feed_url(place: str) -> str:
-    """Nutzt Googles eigenen Orts-Feed (geo) statt einer Stichwortsuche - dieser
-    ist fuer 'lokale Nachrichten zu einem Ort' gebaut und liefert bei kleineren
-    Staedten meist mehr Treffer als eine reine Textsuche nach dem Ortsnamen."""
+    """Google-News-Stichwortsuche nach dem Ortsnamen. Laut aktuellen
+    Erfahrungsberichten (Stand 2026) ist die Suche fuer praezises lokales
+    Monitoring zuverlaessiger als der geo-Feed. Ohne Anfuehrungszeichen
+    (keine Exakt-Phrasen-Suche), damit auch kleinere Orte genug Treffer
+    bekommen."""
     query = urllib.parse.quote(place)
-    return f"https://news.google.com/rss/headlines/section/geo/{query}?hl=de&gl=DE&ceid=DE:de"
+    return f"https://news.google.com/rss/search?q={query}&hl=de&gl=DE&ceid=DE:de"
 ZEITUNG_FILE_EOF
 cat > "$STAGE/app/run_generate.py" <<'ZEITUNG_FILE_EOF'
 import sys
@@ -1141,7 +1155,7 @@ cat > "$STAGE/app/templates/article.html" <<'ZEITUNG_FILE_EOF'
   <div class="article-header">
     <span class="kicker">{{ a.category }}</span>
     <h1>{{ a.title }}</h1>
-    <div class="byline">{{ a.source }}{% if a.author %} · {{ a.author }}{% endif %} · <a href="{{ a.link }}">Original lesen</a></div>
+    <div class="byline">{{ a.publisher or a.source }}{% if a.author %} · {{ a.author }}{% endif %} · <a href="{{ a.link }}">Original lesen</a></div>
   </div>
 
   {% if a.image %}<img class="article-image" src="{{ a.image }}" alt="">{% endif %}
@@ -1227,7 +1241,7 @@ cat > "$STAGE/app/templates/print.html" <<'ZEITUNG_FILE_EOF'
     {% for a in arts %}
     <div class="article-block">
       <h3>{{ a.title }}</h3>
-      <div class="byline">{{ a.source }}{% if a.author %} · {{ a.author }}{% endif %}</div>
+      <div class="byline">{{ a.publisher or a.source }}{% if a.author %} · {{ a.author }}{% endif %}</div>
       {% if a.image %}<img class="article-image" src="{{ a.image }}" alt="">{% endif %}
       <div class="article-body">
         {% for p in a.paragraphs %}<p>{{ p }}</p>{% endfor %}
