@@ -79,6 +79,17 @@ def ordered_categories():
     return known + unknown
 
 
+def get_feed_stats():
+    raw = db.get_setting("feed_stats")
+    if not raw:
+        return {}
+    try:
+        stats_list = json.loads(raw)
+        return {s["url"]: s for s in stats_list}
+    except (json.JSONDecodeError, TypeError, KeyError):
+        return {}
+
+
 def list_editions():
     if not OUTPUT_DIR.exists():
         return []
@@ -103,6 +114,7 @@ def admin(request: Request):
             "categories": ordered_categories(),
             "catalog": catalog.CURATED_FEEDS,
             "edition_count": len(list_editions()),
+            "feed_stats": get_feed_stats(),
         },
     )
 
@@ -171,6 +183,10 @@ def feeds_local(plz: str = Form(...)):
         return RedirectResponse("/", status_code=303)
 
     url = local_news.local_news_feed_url(place)
+    if db.feed_exists(url):
+        db.set_setting("last_status", f"Für {place} (PLZ {plz}) ist bereits eine lokale Rubrik eingerichtet.")
+        return RedirectResponse("/", status_code=303)
+
     db.add_feed(url, f"Lokal: {place} ({plz})", "Lokales", priority=2)
     db.set_setting("last_status", f"Lokale Rubrik für {place} (PLZ {plz}) eingerichtet.")
     return RedirectResponse("/", status_code=303)
@@ -210,7 +226,9 @@ def generate_now():
         return RedirectResponse("/", status_code=303)
 
     result = generator.build_edition(feeds, category_order=get_category_order())
-    if result:
+    db.set_setting("feed_stats", json.dumps(result.get("feed_stats", [])))
+
+    if result["article_count"] > 0:
         db.set_setting("last_run", result["date"])
         db.set_setting(
             "last_status",
@@ -221,7 +239,7 @@ def generate_now():
         db.set_setting(
             "last_status",
             "Es konnte kein Artikel aus den aktiven Feeds geladen werden. "
-            "Prüfe, ob die Feed-URLs korrekt sind und erreichbar sind (siehe journalctl -u zeitung-web -f).",
+            "Details je Feed siehst du unten in der Feed-Tabelle.",
         )
     return RedirectResponse("/", status_code=303)
 
@@ -304,6 +322,13 @@ def list_feeds():
     rows = conn.execute("SELECT * FROM feeds ORDER BY category, name").fetchall()
     conn.close()
     return rows
+
+
+def feed_exists(url):
+    conn = get_conn()
+    row = conn.execute("SELECT 1 FROM feeds WHERE url = ?", (url,)).fetchone()
+    conn.close()
+    return row is not None
 
 
 def add_feed(url, name, category, priority=1):
@@ -464,29 +489,48 @@ def feed_image(entry):
 
 
 def fetch_candidates(feeds, max_per_feed=8):
-    """feeds: list of dicts with url/name/category"""
+    """feeds: list of dicts with url/name/category.
+    Gibt (candidates, feed_stats) zurueck - feed_stats erlaubt es, in der
+    Verwaltung pro Feed zu zeigen, was beim letzten Lauf passiert ist."""
     candidates = []
     seen_links = set()
+    feed_stats = []
     for feed in feeds:
+        entries_found = 0
+        error = None
+        parsed = None
         try:
             parsed = feedparser.parse(feed["url"])
+            entries_found = len(parsed.entries)
+            if getattr(parsed, "bozo", False) and not parsed.entries:
+                error = str(parsed.get("bozo_exception")) or "Feed konnte nicht gelesen werden"
         except Exception as e:
-            print(f"Feed nicht lesbar ({feed['url']}): {e}")
+            error = str(e)
+
+        stat = {"url": feed["url"], "entries": entries_found, "error": error, "taken": 0, "articles": 0}
+        feed_stats.append(stat)
+
+        if parsed is None:
+            if error:
+                print(f"Feed nicht lesbar ({feed['url']}): {error}")
             continue
-        if getattr(parsed, "bozo", False) and not parsed.entries:
-            print(f"Feed liefert keine Einträge ({feed['url']}): {parsed.get('bozo_exception')}")
+        if error:
+            print(f"Feed liefert keine Einträge ({feed['url']}): {error}")
+
         feed_title = feed.get("name") or getattr(parsed.feed, "title", "") or feed["url"]
         for entry in parsed.entries[:max_per_feed]:
             link = entry.get("link")
             if not link or link in seen_links:
                 continue
             seen_links.add(link)
+            stat["taken"] += 1
             candidates.append(
                 {
                     "link": link,
                     "title": entry.get("title", "Ohne Titel"),
                     "category": feed.get("category") or "Allgemein",
                     "source": feed_title,
+                    "feed_url": feed["url"],
                     "published": entry.get("published", ""),
                     "priority": feed.get("priority") or 1,
                     "fallback_html": feed_summary_html(entry),
@@ -494,7 +538,7 @@ def fetch_candidates(feeds, max_per_feed=8):
                 }
             )
     print(f"{len(candidates)} Artikel-Kandidaten aus {len(feeds)} Feed(s) gefunden.")
-    return candidates
+    return candidates, feed_stats
 
 
 def extract_article(candidate, min_chars=200):
@@ -631,7 +675,8 @@ def category_sort_key(cat, order):
 
 def build_edition(feeds, category_order=None, per_category_cap=6, max_articles=40, max_candidates=80):
     category_order = category_order or []
-    candidates = fetch_candidates(feeds)[:max_candidates]
+    candidates, feed_stats = fetch_candidates(feeds)
+    candidates = candidates[:max_candidates]
 
     extracted = []
     with ThreadPoolExecutor(max_workers=8) as pool:
@@ -643,9 +688,16 @@ def build_edition(feeds, category_order=None, per_category_cap=6, max_articles=4
 
     print(f"{len(extracted)} von {len(candidates)} Kandidaten als Artikel übernommen.")
 
+    articles_by_feed = {}
+    for a in extracted:
+        fu = a.get("feed_url")
+        articles_by_feed[fu] = articles_by_feed.get(fu, 0) + 1
+    for s in feed_stats:
+        s["articles"] = articles_by_feed.get(s["url"], 0)
+
     if not extracted:
         print("Keine Artikel verwertbar - keine Ausgabe erstellt.")
-        return None
+        return {"date": None, "article_count": 0, "section_count": 0, "feed_stats": feed_stats}
 
     # Bester Artikel insgesamt wird Aufmacher.
     extracted.sort(key=score_article, reverse=True)
@@ -760,6 +812,7 @@ def build_edition(feeds, category_order=None, per_category_cap=6, max_articles=4
         "date": edition_date,
         "article_count": len(articles),
         "section_count": len(sections_all),
+        "feed_stats": feed_stats,
     }
 ZEITUNG_FILE_EOF
 cat > "$STAGE/app/catalog.py" <<'ZEITUNG_FILE_EOF'
@@ -831,9 +884,11 @@ def resolve_plz_de(plz: str):
 
 
 def local_news_feed_url(place: str) -> str:
-    """Baut eine Google-News-RSS-Suche fuer einen Ortsnamen (deutschsprachig)."""
-    query = urllib.parse.quote(f'"{place}"')
-    return f"https://news.google.com/rss/search?q={query}&hl=de&gl=DE&ceid=DE:de"
+    """Nutzt Googles eigenen Orts-Feed (geo) statt einer Stichwortsuche - dieser
+    ist fuer 'lokale Nachrichten zu einem Ort' gebaut und liefert bei kleineren
+    Staedten meist mehr Treffer als eine reine Textsuche nach dem Ortsnamen."""
+    query = urllib.parse.quote(place)
+    return f"https://news.google.com/rss/headlines/section/geo/{query}?hl=de&gl=DE&ceid=DE:de"
 ZEITUNG_FILE_EOF
 cat > "$STAGE/app/run_generate.py" <<'ZEITUNG_FILE_EOF'
 import sys
@@ -954,9 +1009,10 @@ cat > "$STAGE/app/templates/admin.html" <<'ZEITUNG_FILE_EOF'
   <h2>Feeds ({{ feeds|length }})</h2>
   {% if feeds %}
   <table class="feed-table">
-    <thead><tr><th>Aktiv</th><th>Name</th><th>Rubrik</th><th>Priorität</th><th>URL</th><th></th></tr></thead>
+    <thead><tr><th>Aktiv</th><th>Name</th><th>Rubrik</th><th>Priorität</th><th>Letzter Lauf</th><th>URL</th><th></th></tr></thead>
     <tbody>
       {% for f in feeds %}
+      {% set stat = feed_stats.get(f.url) %}
       <tr>
         <td>
           <form method="post" action="/feeds/{{ f.id }}/toggle">
@@ -973,6 +1029,19 @@ cat > "$STAGE/app/templates/admin.html" <<'ZEITUNG_FILE_EOF'
               <option value="3" {{ "selected" if f.priority == 3 else "" }}>Sehr wichtig</option>
             </select>
           </form>
+        </td>
+        <td>
+          {% if not stat %}
+            <span class="feed-diag">– noch nicht gelaufen</span>
+          {% elif stat.error %}
+            <span class="feed-diag error" title="{{ stat.error }}">⚠ Fehler</span>
+          {% elif stat.entries == 0 %}
+            <span class="feed-diag warn">0 Einträge im Feed</span>
+          {% elif stat.articles == 0 %}
+            <span class="feed-diag warn">{{ stat.entries }} gefunden, 0 übernommen</span>
+          {% else %}
+            <span class="feed-diag ok">{{ stat.articles }} von {{ stat.entries }} übernommen</span>
+          {% endif %}
         </td>
         <td class="url">{{ f.url }}</td>
         <td>
@@ -1732,6 +1801,15 @@ h2 { font-size: 16px; margin-top: 32px; border-bottom: 1px solid var(--border); 
   font-size: 13px;
   background: #fff;
 }
+
+.feed-diag {
+  font-size: 12px;
+  color: #888;
+  white-space: nowrap;
+}
+.feed-diag.ok { color: #2e7d32; }
+.feed-diag.warn { color: #b8860b; }
+.feed-diag.error { color: #a33; cursor: help; }
   width: 100%;
   border-collapse: collapse;
   margin-top: 12px;
