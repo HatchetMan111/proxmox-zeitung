@@ -141,6 +141,17 @@ def get_feed_stats():
         return {}
 
 
+RETENTION_DEFAULT = 30
+
+
+def get_retention_days():
+    raw = db.get_setting("retention_days")
+    try:
+        return max(1, int(raw)) if raw else RETENTION_DEFAULT
+    except (TypeError, ValueError):
+        return RETENTION_DEFAULT
+
+
 def list_editions():
     if not OUTPUT_DIR.exists():
         return []
@@ -166,6 +177,7 @@ def admin(request: Request):
             "catalog": catalog.CURATED_FEEDS,
             "edition_count": len(list_editions()),
             "feed_stats": get_feed_stats(),
+            "retention_days": get_retention_days(),
         },
     )
 
@@ -269,6 +281,14 @@ def save_category_order(order: str = Form("")):
     return RedirectResponse("/", status_code=303)
 
 
+@app.post("/settings/retention")
+def save_retention(days: int = Form(...)):
+    days = max(1, min(365, days))
+    db.set_setting("retention_days", str(days))
+    db.set_setting("last_status", f"Ausgaben werden künftig {days} Tage aufbewahrt.")
+    return RedirectResponse("/", status_code=303)
+
+
 @app.post("/generate")
 def generate_now():
     feeds = [dict(f) for f in db.enabled_feeds()]
@@ -278,6 +298,7 @@ def generate_now():
 
     result = generator.build_edition(feeds, category_order=get_category_order())
     db.set_setting("feed_stats", json.dumps(result.get("feed_stats", [])))
+    generator.cleanup_old_editions(get_retention_days())
 
     if result["article_count"] > 0:
         db.set_setting("last_run", result["date"])
@@ -314,6 +335,17 @@ def lesen_pdf():
 def archiv(request: Request):
     dates = list_editions()
     return templates.TemplateResponse(request, "archiv.html", {"dates": dates})
+
+
+@app.get("/read/{edition_date}")
+def get_read(edition_date: str):
+    return db.get_read_slugs(edition_date)
+
+
+@app.post("/read/{edition_date}/{slug}")
+def post_read(edition_date: str, slug: str):
+    db.mark_read(edition_date, slug)
+    return {"ok": True}
 
 
 # Erst NACH den eigenen Routen mounten, damit /lesen und /archiv nicht vom
@@ -358,6 +390,16 @@ def init_db():
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS read_articles (
+            edition_date TEXT NOT NULL,
+            slug TEXT NOT NULL,
+            read_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (edition_date, slug)
         )
         """
     )
@@ -427,6 +469,25 @@ def distinct_categories():
     return [r["category"] for r in rows]
 
 
+def mark_read(edition_date, slug):
+    conn = get_conn()
+    conn.execute(
+        "INSERT OR IGNORE INTO read_articles (edition_date, slug) VALUES (?, ?)",
+        (edition_date, slug),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_read_slugs(edition_date):
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT slug FROM read_articles WHERE edition_date = ?", (edition_date,)
+    ).fetchall()
+    conn.close()
+    return [r["slug"] for r in rows]
+
+
 def get_setting(key, default=None):
     conn = get_conn()
     row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
@@ -448,10 +509,12 @@ cat > "$STAGE/app/generator.py" <<'ZEITUNG_FILE_EOF'
 import html as html_module
 import json
 import re
+import shutil
 import urllib.request
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
+from difflib import SequenceMatcher
 from io import BytesIO
 from pathlib import Path
 
@@ -724,6 +787,53 @@ def download_image(url, out_dir, filename):
         return None
 
 
+DUPLICATE_TITLE_THRESHOLD = 0.72
+
+
+def title_similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, a.lower().strip(), b.lower().strip()).ratio()
+
+
+def deduplicate_articles(articles, threshold=DUPLICATE_TITLE_THRESHOLD):
+    """Entfernt Artikel, deren Titel einem bereits behaltenen Artikel sehr
+    aehnlich ist - typischerweise dieselbe dpa/Agentur-Meldung, die ueber
+    mehrere Feeds gleichzeitig hereinkommt. Bei einem Duplikat gewinnt der
+    hoeher bewertete (Prioritaet/Textlaenge), der Rest wird verworfen."""
+    kept = []
+    dropped = 0
+    for a in sorted(articles, key=score_article, reverse=True):
+        is_dup = any(title_similarity(a["title"], k["title"]) >= threshold for k in kept)
+        if is_dup:
+            dropped += 1
+            continue
+        kept.append(a)
+    if dropped:
+        print(f"{dropped} Duplikat(e) anhand aehnlicher Titel entfernt.")
+    return kept
+
+
+def cleanup_old_editions(retention_days=30):
+    """Loescht archivierte Ausgaben (inkl. Bilder/PDF), die aelter als
+    retention_days sind, damit der Speicher nicht unbegrenzt waechst."""
+    if not OUTPUT_DIR.exists():
+        return 0
+    cutoff = datetime.now().date() - timedelta(days=retention_days)
+    removed = 0
+    for p in OUTPUT_DIR.iterdir():
+        if not p.is_dir() or p.name == "latest":
+            continue
+        try:
+            folder_date = datetime.strptime(p.name, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if folder_date < cutoff:
+            shutil.rmtree(p, ignore_errors=True)
+            removed += 1
+    if removed:
+        print(f"{removed} alte Ausgabe(n) aelter als {retention_days} Tage aufgeraeumt.")
+    return removed
+
+
 def category_sort_key(cat, order):
     """order: Liste von Rubriknamen in gewuenschter Reihenfolge (Drag&Drop in der
     Verwaltung). Rubriken darin kommen zuerst in dieser Reihenfolge, unbekannte
@@ -761,6 +871,8 @@ def build_edition(feeds, category_order=None, per_category_cap=6, max_articles=4
     if not extracted:
         print("Keine Artikel verwertbar - keine Ausgabe erstellt.")
         return {"date": None, "article_count": 0, "section_count": 0, "feed_stats": feed_stats}
+
+    extracted = deduplicate_articles(extracted)
 
     # Bester Artikel insgesamt wird Aufmacher.
     extracted.sort(key=score_article, reverse=True)
@@ -827,6 +939,7 @@ def build_edition(feeds, category_order=None, per_category_cap=6, max_articles=4
         paper_name=PAPER_NAME,
         date_display=date_display,
         time_display=time_display,
+        edition_date=edition_date,
         lead=lead,
         sections=sections,
         rubric_nav=rubric_nav,
@@ -845,6 +958,7 @@ def build_edition(feeds, category_order=None, per_category_cap=6, max_articles=4
             next_link=next_link,
             date_display=date_display,
             time_display=time_display,
+            edition_date=edition_date,
             page_num=i + 1,
             total_pages=total,
             rubric_nav=rubric_nav,
@@ -956,6 +1070,7 @@ def local_news_feed_url(place: str) -> str:
     return f"https://news.google.com/rss/search?q={query}&hl=de&gl=DE&ceid=DE:de"
 ZEITUNG_FILE_EOF
 cat > "$STAGE/app/run_generate.py" <<'ZEITUNG_FILE_EOF'
+import json
 import sys
 from pathlib import Path
 
@@ -964,14 +1079,48 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import db
 import generator
 
+RETENTION_DEFAULT = 30
+
+
+def get_category_order():
+    raw = db.get_setting("category_order")
+    if not raw:
+        return []
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+def get_retention_days():
+    raw = db.get_setting("retention_days")
+    try:
+        return max(1, int(raw)) if raw else RETENTION_DEFAULT
+    except (TypeError, ValueError):
+        return RETENTION_DEFAULT
+
+
 if __name__ == "__main__":
     db.init_db()
     feeds = [dict(f) for f in db.enabled_feeds()]
-    result = generator.build_edition(feeds)
-    if result:
+    result = generator.build_edition(feeds, category_order=get_category_order())
+    db.set_setting("feed_stats", json.dumps(result.get("feed_stats", [])))
+    generator.cleanup_old_editions(get_retention_days())
+
+    if result["article_count"] > 0:
         db.set_setting("last_run", result["date"])
+        db.set_setting(
+            "last_status",
+            f"Ausgabe vom {result['date']} mit {result['article_count']} Artikel(n) "
+            f"in {result['section_count']} Rubriken erstellt.",
+        )
         print(f"Ausgabe {result['date']} erstellt mit {result['article_count']} Artikeln.")
     else:
+        db.set_setting(
+            "last_status",
+            "Es konnte kein Artikel aus den aktiven Feeds geladen werden. "
+            "Details je Feed siehst du unten in der Feed-Tabelle.",
+        )
         print("Keine Artikel gefunden - keine Ausgabe erstellt.")
 ZEITUNG_FILE_EOF
 cat > "$STAGE/app/requirements.txt" <<'ZEITUNG_FILE_EOF'
@@ -1071,6 +1220,15 @@ cat > "$STAGE/app/templates/admin.html" <<'ZEITUNG_FILE_EOF'
     <button type="submit">Alle importieren</button>
   </form>
 
+  <h2>Einstellungen</h2>
+  <form method="post" action="/settings/retention" class="retention-form">
+    <label for="retention-days">Alte Ausgaben aufbewahren für</label>
+    <input type="number" id="retention-days" name="days" min="1" max="365" value="{{ retention_days }}">
+    <span>Tage</span>
+    <button type="submit">Speichern</button>
+  </form>
+  <p class="hint">Ältere Ausgaben (inkl. Bilder/PDF) werden nach jeder Generierung automatisch gelöscht.</p>
+
   <h2>Feeds ({{ feeds|length }})</h2>
   {% if feeds %}
   <table class="feed-table">
@@ -1136,7 +1294,7 @@ cat > "$STAGE/app/templates/front_page.html" <<'ZEITUNG_FILE_EOF'
 <title>{{ paper_name }} – {{ date_display }}</title>
 <link rel="stylesheet" href="/static/style.css">
 </head>
-<body data-next="{{ lead.slug }}.html">
+<body data-next="{{ lead.slug }}.html" data-edition="{{ edition_date }}">
 <header class="masthead">
   <h1>{{ paper_name }}</h1>
   <div class="masthead-sub">{{ date_display }} · {{ time_display }} Uhr · automatisch erstellte Ausgabe</div>
@@ -1148,7 +1306,7 @@ cat > "$STAGE/app/templates/front_page.html" <<'ZEITUNG_FILE_EOF'
 {% endif %}
 
 <main>
-  <article class="lead">
+  <article class="lead" data-slug="{{ lead.slug }}">
     {% if lead.image %}<img src="{{ lead.image }}" alt="">{% endif %}
     <span class="kicker">{{ lead.category }}</span>
     <h2><a href="{{ lead.slug }}.html">{{ lead.title }}</a></h2>
@@ -1161,7 +1319,7 @@ cat > "$STAGE/app/templates/front_page.html" <<'ZEITUNG_FILE_EOF'
     <h2 class="rubrik-title">{{ cat }}</h2>
     <div class="teaser-grid">
       {% for t in arts %}
-      <article class="teaser">
+      <article class="teaser" data-slug="{{ t.slug }}">
         {% if t.image %}<img src="{{ t.image }}" alt="">{% endif %}
         <h3><a href="{{ t.slug }}.html">{{ t.title }}</a></h3>
         <p class="excerpt">{{ t.excerpt }}</p>
@@ -1178,6 +1336,7 @@ cat > "$STAGE/app/templates/front_page.html" <<'ZEITUNG_FILE_EOF'
 </footer>
 {% include "_reader_controls.html" %}
 <script src="/static/swipe.js" defer></script>
+<script src="/static/read.js" defer></script>
 </body>
 </html>
 ZEITUNG_FILE_EOF
@@ -1191,7 +1350,7 @@ cat > "$STAGE/app/templates/article.html" <<'ZEITUNG_FILE_EOF'
 <title>{{ a.title }}</title>
 <link rel="stylesheet" href="/static/style.css">
 </head>
-<body data-next="{{ next_link }}" data-prev="{{ prev_link }}">
+<body data-next="{{ next_link }}" data-prev="{{ prev_link }}" data-edition="{{ edition_date }}" data-slug="{{ a.slug }}">
 <header class="masthead">
   <h1><a href="index.html">{{ paper_name }}</a></h1>
   <div class="masthead-sub">{{ date_display }} · {{ time_display }} Uhr</div>
@@ -1226,6 +1385,7 @@ cat > "$STAGE/app/templates/article.html" <<'ZEITUNG_FILE_EOF'
 </main>
 {% include "_reader_controls.html" %}
 <script src="/static/swipe.js" defer></script>
+<script src="/static/read.js" defer></script>
 </body>
 </html>
 ZEITUNG_FILE_EOF
@@ -1641,6 +1801,11 @@ footer a { color: var(--ink-light); }
   margin-top: 14px;
 }
 
+.lead.read,
+.teaser.read {
+  opacity: 0.5;
+}
+
 .reader-controls {
   position: fixed;
   bottom: 16px;
@@ -1859,6 +2024,28 @@ h2 { font-size: 16px; margin-top: 32px; border-bottom: 1px solid var(--border); 
   cursor: pointer;
 }
 
+.retention-form {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  font-size: 14px;
+}
+.retention-form input[type="number"] {
+  width: 70px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.retention-form button {
+  padding: 8px 14px;
+  border: none;
+  background: var(--ink);
+  color: #fff;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
 .priority-select {
   padding: 6px 8px;
   border: 1px solid var(--border);
@@ -2060,6 +2247,41 @@ cat > "$STAGE/app/static/admin.js" <<'ZEITUNG_FILE_EOF'
         sel.closest("form").submit();
       });
     });
+  });
+})();
+ZEITUNG_FILE_EOF
+cat > "$STAGE/app/static/read.js" <<'ZEITUNG_FILE_EOF'
+(function () {
+  document.addEventListener("DOMContentLoaded", function () {
+    var edition = document.body.getAttribute("data-edition");
+    if (!edition) return;
+
+    var slug = document.body.getAttribute("data-slug");
+    if (slug) {
+      // Artikelseite: als gelesen markieren (fire-and-forget, kein Fehler stoert das Lesen)
+      fetch("/read/" + encodeURIComponent(edition) + "/" + encodeURIComponent(slug), {
+        method: "POST",
+      }).catch(function () {});
+      return;
+    }
+
+    // Titelseite: bereits gelesene Artikel dezent markieren
+    fetch("/read/" + encodeURIComponent(edition))
+      .then(function (r) {
+        return r.ok ? r.json() : [];
+      })
+      .then(function (readSlugs) {
+        var set = {};
+        readSlugs.forEach(function (s) {
+          set[s] = true;
+        });
+        document.querySelectorAll("[data-slug]").forEach(function (el) {
+          if (set[el.getAttribute("data-slug")]) {
+            el.classList.add("read");
+          }
+        });
+      })
+      .catch(function () {});
   });
 })();
 ZEITUNG_FILE_EOF
