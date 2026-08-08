@@ -28,7 +28,7 @@ if ! pct status "$CTID" >/dev/null 2>&1; then
 fi
 
 STAGE=$(mktemp -d)
-mkdir -p "$STAGE/app/templates" "$STAGE/app/static"
+mkdir -p "$STAGE/app/templates" "$STAGE/app/static" "$STAGE/systemd"
 
 cat > "$STAGE/app/main.py" <<'ZEITUNG_FILE_EOF'
 import json
@@ -843,6 +843,7 @@ def build_edition(
     local_max_per_feed = 40 if local_unlimited else None
     if local_unlimited:
         max_candidates = max(max_candidates, 140)
+        max_articles = max(max_articles, 60)
 
     candidates, feed_stats = fetch_candidates(feeds, local_max_per_feed=local_max_per_feed)
     candidates = candidates[:max_candidates]
@@ -890,8 +891,18 @@ def build_edition(
         cap = 30 if (local_unlimited and cat == "Lokales") else per_category_cap
         capped.extend(arts[:cap])
     if len(capped) > max_articles:
-        capped.sort(key=score_article, reverse=True)
-        capped = capped[:max_articles]
+        if local_unlimited:
+            # "Alle lokalen Schlagzeilen anzeigen" darf nicht durch die
+            # allgemeine Obergrenze wieder zunichte gemacht werden - Lokales
+            # bleibt komplett erhalten, nur die uebrigen Rubriken werden gekappt.
+            protected = [a for a in capped if a["category"] == "Lokales"]
+            rest = [a for a in capped if a["category"] != "Lokales"]
+            rest.sort(key=score_article, reverse=True)
+            budget = max(0, max_articles - len(protected))
+            capped = protected + rest[:budget]
+        else:
+            capped.sort(key=score_article, reverse=True)
+            capped = capped[:max_articles]
 
     # Finale Rubrik-Gruppen (nach gespeicherter Reihenfolge, sonst alphabetisch,
     # "Allgemein" ans Ende) und finale Artikel-Reihenfolge fuer Blaettern/Vor-Zurueck.
@@ -1074,6 +1085,7 @@ ZEITUNG_FILE_EOF
 cat > "$STAGE/app/run_generate.py" <<'ZEITUNG_FILE_EOF'
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -1108,6 +1120,16 @@ def get_local_unlimited():
 
 if __name__ == "__main__":
     db.init_db()
+
+    # Dieses Skript laeuft zweimal taeglich (Haupttermin + Wiederholung, siehe
+    # zeitung-generate.timer). Ist die heutige Ausgabe schon da, nichts tun -
+    # die Wiederholung greift nur, wenn der erste Versuch komplett fehlschlug.
+    edition_date = datetime.now().strftime("%Y-%m-%d")
+    today_index = generator.OUTPUT_DIR / edition_date / "index.html"
+    if today_index.exists():
+        print(f"Ausgabe vom {edition_date} existiert bereits - kein erneuter Versuch noetig.")
+        sys.exit(0)
+
     feeds = [dict(f) for f in db.enabled_feeds()]
     result = generator.build_edition(
         feeds, category_order=get_category_order(), local_unlimited=get_local_unlimited()
@@ -1351,9 +1373,14 @@ cat > "$STAGE/app/templates/front_page.html" <<'ZEITUNG_FILE_EOF'
       {% for t in arts %}
       <article class="teaser" data-slug="{{ t.slug }}">
         {% if t.image %}<img src="{{ t.image }}" alt="">{% endif %}
-        {% if not t.full_text %}<span class="badge-short">Kurzmeldung</span>{% endif %}
+        {% if not t.full_text %}
+        <span class="badge-short">Kurzmeldung</span>
+        <h3><a href="{{ t.slug }}.html">{{ t.title }}</a></h3>
+        <p class="excerpt teaser-source">{{ t.publisher or t.source }}</p>
+        {% else %}
         <h3><a href="{{ t.slug }}.html">{{ t.title }}</a></h3>
         <p class="excerpt">{{ t.excerpt }}</p>
+        {% endif %}
       </article>
       {% endfor %}
     </div>
@@ -1677,6 +1704,11 @@ main {
   letter-spacing: 0.5px;
   color: #a87c00;
   margin-bottom: 6px;
+}
+
+.teaser-source {
+  font-size: 13px;
+  font-style: italic;
 }
 
 .lead {
@@ -2529,8 +2561,20 @@ ABCUAAAEJQAAQQkAQFACABCUAAAEJQAAQZXW42MueOWlBt8BQBPzBAAQlAAABCUAAEEJAEBQRWO7
 dUu9AYAEPAEABCUAAEEJAEBQAgAQlAAABCUAAEEJAEBQAgAQlAAABCUAAEEJAEBQ/wv74QCIv84A
 HgAAAABJRU5ErkJggg==
 ZEITUNG_B64_EOF
+cat > "$STAGE/systemd/zeitung-generate.timer" <<'ZEITUNG_FILE_EOF'
+[Unit]
+Description=Taegliche Zeitungserstellung um 05:30 Uhr (mit Wiederholung um 08:00 Uhr bei Totalausfall)
 
-tar czf "$STAGE/zeitung-update.tar.gz" -C "$STAGE" app
+[Timer]
+OnCalendar=*-*-* 05:30:00
+OnCalendar=*-*-* 08:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+ZEITUNG_FILE_EOF
+
+tar czf "$STAGE/zeitung-update.tar.gz" -C "$STAGE" app systemd
 
 echo "Uebertrage aktualisierte Dateien in Container $CTID..."
 pct push "$CTID" "$STAGE/zeitung-update.tar.gz" /root/zeitung-update.tar.gz
@@ -2538,6 +2582,9 @@ pct push "$CTID" "$STAGE/zeitung-update.tar.gz" /root/zeitung-update.tar.gz
 pct exec "$CTID" -- bash -c "
   tar xzf /root/zeitung-update.tar.gz -C /opt/zeitung &&
   /opt/zeitung/venv/bin/pip install -q -r /opt/zeitung/app/requirements.txt &&
+  cp /opt/zeitung/systemd/zeitung-generate.timer /etc/systemd/system/ &&
+  systemctl daemon-reload &&
+  systemctl restart zeitung-generate.timer &&
   systemctl restart zeitung-web.service
 "
 
