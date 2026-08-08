@@ -152,6 +152,10 @@ def get_retention_days():
         return RETENTION_DEFAULT
 
 
+def get_local_unlimited():
+    return db.get_setting("local_unlimited") == "1"
+
+
 def list_editions():
     if not OUTPUT_DIR.exists():
         return []
@@ -178,6 +182,7 @@ def admin(request: Request):
             "edition_count": len(list_editions()),
             "feed_stats": get_feed_stats(),
             "retention_days": get_retention_days(),
+            "local_unlimited": get_local_unlimited(),
         },
     )
 
@@ -289,6 +294,16 @@ def save_retention(days: int = Form(...)):
     return RedirectResponse("/", status_code=303)
 
 
+@app.post("/settings/local-unlimited")
+def save_local_unlimited(enabled: str = Form("")):
+    db.set_setting("local_unlimited", "1" if enabled else "0")
+    db.set_setting(
+        "last_status",
+        "Zeigt künftig alle lokalen Schlagzeilen." if enabled else "Lokale Rubrik wieder wie andere Rubriken begrenzt.",
+    )
+    return RedirectResponse("/", status_code=303)
+
+
 @app.post("/generate")
 def generate_now():
     feeds = [dict(f) for f in db.enabled_feeds()]
@@ -296,7 +311,9 @@ def generate_now():
         db.set_setting("last_status", "Keine aktiven Feeds - bitte zuerst einen Feed hinzufügen und anhaken.")
         return RedirectResponse("/", status_code=303)
 
-    result = generator.build_edition(feeds, category_order=get_category_order())
+    result = generator.build_edition(
+        feeds, category_order=get_category_order(), local_unlimited=get_local_unlimited()
+    )
     db.set_setting("feed_stats", json.dumps(result.get("feed_stats", [])))
     generator.cleanup_old_editions(get_retention_days())
 
@@ -512,7 +529,7 @@ import re
 import shutil
 import urllib.request
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from io import BytesIO
@@ -602,10 +619,13 @@ def feed_image(entry):
     return None
 
 
-def fetch_candidates(feeds, max_per_feed=8):
+def fetch_candidates(feeds, max_per_feed=8, local_max_per_feed=None):
     """feeds: list of dicts with url/name/category.
     Gibt (candidates, feed_stats) zurueck - feed_stats erlaubt es, in der
-    Verwaltung pro Feed zu zeigen, was beim letzten Lauf passiert ist."""
+    Verwaltung pro Feed zu zeigen, was beim letzten Lauf passiert ist.
+    local_max_per_feed: falls gesetzt, gilt fuer Feeds der Rubrik 'Lokales'
+    ein hoeheres Limit als fuer alle anderen (siehe 'Alle lokalen
+    Schlagzeilen anzeigen' in der Verwaltung)."""
     candidates = []
     seen_links = set()
     feed_stats = []
@@ -621,7 +641,14 @@ def fetch_candidates(feeds, max_per_feed=8):
         except Exception as e:
             error = str(e)
 
-        stat = {"url": feed["url"], "entries": entries_found, "error": error, "taken": 0, "articles": 0}
+        stat = {
+            "url": feed["url"],
+            "entries": entries_found,
+            "error": error,
+            "taken": 0,
+            "articles": 0,
+            "candidates": [],
+        }
         feed_stats.append(stat)
 
         if parsed is None:
@@ -631,8 +658,11 @@ def fetch_candidates(feeds, max_per_feed=8):
         if error:
             print(f"Feed liefert keine Einträge ({feed['url']}): {error}")
 
+        is_local = feed.get("category") == "Lokales"
+        limit = local_max_per_feed if (is_local and local_max_per_feed) else max_per_feed
+
         feed_title = feed.get("name") or getattr(parsed.feed, "title", "") or feed["url"]
-        for entry in parsed.entries[:max_per_feed]:
+        for entry in parsed.entries[:limit]:
             link = entry.get("link")
             if not link or link in seen_links:
                 continue
@@ -661,6 +691,7 @@ def extract_article(candidate, min_chars=200):
     image_url = candidate.get("fallback_image")
     title = candidate["title"]
     author = None
+    full_text = False
 
     try:
         downloaded = trafilatura.fetch_url(candidate["link"], config=TRAFILATURA_CONFIG)
@@ -689,6 +720,7 @@ def extract_article(candidate, min_chars=200):
                 title = data.get("title") or title
                 author = data.get("author")
                 image_url = data.get("image") or image_url
+                full_text = True
 
     if not paragraphs and candidate.get("fallback_html"):
         # Volltext nicht erreichbar/blockiert (JS-Seite, Paywall, ...) - RSS-eigenen Text nutzen,
@@ -709,26 +741,26 @@ def extract_article(candidate, min_chars=200):
         ]
 
     if not paragraphs:
-        print(f"Kein nutzbarer Text für: {candidate['link']}")
-        return None
+        return None, "Kein Text extrahierbar (Seite blockiert Zugriff oder liefert kein Snippet)"
 
     paragraphs = [clean_paragraph(p) for p in paragraphs]
     paragraphs = [p for p in paragraphs if len(p) >= 15]
 
     if not paragraphs:
-        print(f"Nach Bereinigung kein Text übrig für: {candidate['link']}")
-        return None
+        return None, "Nach Bereinigung kein Text übrig"
 
     excerpt = paragraphs[0][:220]
     clean = {k: v for k, v in candidate.items() if k not in ("fallback_html", "fallback_image")}
-    return {
+    article = {
         **clean,
         "title": title,
         "excerpt": excerpt,
         "paragraphs": paragraphs,
         "author": author,
         "image_url": image_url,
+        "full_text": full_text,
     }
+    return article, ("Volltext" if full_text else "Kurzmeldung")
 
 
 def score_article(article):
@@ -846,27 +878,46 @@ def category_sort_key(cat, order):
     return (1, 0, cat.lower())
 
 
-def build_edition(feeds, category_order=None, per_category_cap=6, max_articles=40, max_candidates=80):
+def build_edition(
+    feeds,
+    category_order=None,
+    per_category_cap=6,
+    max_articles=40,
+    max_candidates=80,
+    local_unlimited=False,
+):
     category_order = category_order or []
-    candidates, feed_stats = fetch_candidates(feeds)
+
+    # "Alle lokalen Schlagzeilen anzeigen": Lokal-Feeds werden viel tiefer
+    # ausgelesen und in der finalen Ausgabe nicht auf die uebliche
+    # Rubrik-Obergrenze gedeckelt.
+    local_max_per_feed = 40 if local_unlimited else None
+    if local_unlimited:
+        max_candidates = max(max_candidates, 140)
+        max_articles = max(max_articles, 60)
+
+    candidates, feed_stats = fetch_candidates(feeds, local_max_per_feed=local_max_per_feed)
     candidates = candidates[:max_candidates]
+    stats_by_url = {s["url"]: s for s in feed_stats}
 
-    extracted = []
+    def _process(c):
+        article, reason = extract_article(c)
+        return c, article, reason
+
+    results = []
     with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = [pool.submit(extract_article, c) for c in candidates]
-        for fut in as_completed(futures):
-            art = fut.result()
-            if art:
-                extracted.append(art)
+        for c, article, reason in pool.map(_process, candidates):
+            results.append((c, article, reason))
+            s = stats_by_url.get(c.get("feed_url"))
+            if s is not None:
+                status = "full" if (article and article.get("full_text")) else ("headline" if article else "rejected")
+                s["candidates"].append({"title": c["title"], "link": c["link"], "status": status, "reason": reason})
 
+    extracted = [article for _, article, _ in results if article]
     print(f"{len(extracted)} von {len(candidates)} Kandidaten als Artikel übernommen.")
 
-    articles_by_feed = {}
-    for a in extracted:
-        fu = a.get("feed_url")
-        articles_by_feed[fu] = articles_by_feed.get(fu, 0) + 1
     for s in feed_stats:
-        s["articles"] = articles_by_feed.get(s["url"], 0)
+        s["articles"] = sum(1 for cand in s["candidates"] if cand["status"] in ("full", "headline"))
 
     if not extracted:
         print("Keine Artikel verwertbar - keine Ausgabe erstellt.")
@@ -880,16 +931,29 @@ def build_edition(feeds, category_order=None, per_category_cap=6, max_articles=4
 
     # Nach Rubrik gruppieren (jede Rubrik bekommt spaeter ihre eigene(n) Seite(n)),
     # pro Rubrik gedeckelt, damit keine einzelne Rubrik die ganze Ausgabe dominiert.
+    # "Lokales" bekommt bei aktiviertem local_unlimited eine deutlich hoehere
+    # Obergrenze, damit tatsaechlich (fast) alle gefundenen Schlagzeilen erscheinen.
     by_category = OrderedDict()
     for a in extracted:
         by_category.setdefault(a["category"], []).append(a)
 
     capped = []
-    for arts in by_category.values():
-        capped.extend(arts[:per_category_cap])
+    for cat, arts in by_category.items():
+        cap = 30 if (local_unlimited and cat == "Lokales") else per_category_cap
+        capped.extend(arts[:cap])
     if len(capped) > max_articles:
-        capped.sort(key=score_article, reverse=True)
-        capped = capped[:max_articles]
+        if local_unlimited:
+            # "Alle lokalen Schlagzeilen anzeigen" darf nicht durch die
+            # allgemeine Obergrenze wieder zunichte gemacht werden - Lokales
+            # bleibt komplett erhalten, nur die uebrigen Rubriken werden gekappt.
+            protected = [a for a in capped if a["category"] == "Lokales"]
+            rest = [a for a in capped if a["category"] != "Lokales"]
+            rest.sort(key=score_article, reverse=True)
+            budget = max(0, max_articles - len(protected))
+            capped = protected + rest[:budget]
+        else:
+            capped.sort(key=score_article, reverse=True)
+            capped = capped[:max_articles]
 
     # Finale Rubrik-Gruppen (nach gespeicherter Reihenfolge, sonst alphabetisch,
     # "Allgemein" ans Ende) und finale Artikel-Reihenfolge fuer Blaettern/Vor-Zurueck.
@@ -1072,6 +1136,7 @@ ZEITUNG_FILE_EOF
 cat > "$STAGE/app/run_generate.py" <<'ZEITUNG_FILE_EOF'
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -1100,10 +1165,26 @@ def get_retention_days():
         return RETENTION_DEFAULT
 
 
+def get_local_unlimited():
+    return db.get_setting("local_unlimited") == "1"
+
+
 if __name__ == "__main__":
     db.init_db()
+
+    # Dieses Skript laeuft zweimal taeglich (Haupttermin + Wiederholung, siehe
+    # zeitung-generate.timer). Ist die heutige Ausgabe schon da, nichts tun -
+    # die Wiederholung greift nur, wenn der erste Versuch komplett fehlschlug.
+    edition_date = datetime.now().strftime("%Y-%m-%d")
+    today_index = generator.OUTPUT_DIR / edition_date / "index.html"
+    if today_index.exists():
+        print(f"Ausgabe vom {edition_date} existiert bereits - kein erneuter Versuch noetig.")
+        sys.exit(0)
+
     feeds = [dict(f) for f in db.enabled_feeds()]
-    result = generator.build_edition(feeds, category_order=get_category_order())
+    result = generator.build_edition(
+        feeds, category_order=get_category_order(), local_unlimited=get_local_unlimited()
+    )
     db.set_setting("feed_stats", json.dumps(result.get("feed_stats", [])))
     generator.cleanup_old_editions(get_retention_days())
 
@@ -1184,6 +1265,12 @@ cat > "$STAGE/app/templates/admin.html" <<'ZEITUNG_FILE_EOF'
     <input type="text" name="plz" placeholder="z.B. 97980" pattern="\d{5}" maxlength="5" required>
     <button type="submit">Lokale Rubrik einrichten</button>
   </form>
+  <form method="post" action="/settings/local-unlimited" class="local-unlimited-form">
+    <label>
+      <input type="checkbox" name="enabled" value="1" {{ "checked" if local_unlimited else "" }} onchange="this.form.submit()">
+      Alle lokalen Schlagzeilen anzeigen (auch als reine Kurzmeldung, statt nur die besten 6)
+    </label>
+  </form>
 
   <h2>Feed-Katalog</h2>
   <p class="hint">Geprüfte Feed-Vorschläge zum Anhaken – kein URL-Suchen nötig.</p>
@@ -1260,10 +1347,26 @@ cat > "$STAGE/app/templates/admin.html" <<'ZEITUNG_FILE_EOF'
             <span class="feed-diag error" title="{{ stat.error }}">⚠ Fehler</span>
           {% elif stat.entries == 0 %}
             <span class="feed-diag warn">0 Einträge im Feed</span>
-          {% elif stat.articles == 0 %}
-            <span class="feed-diag warn">{{ stat.entries }} gefunden, 0 übernommen</span>
+          {% elif not stat.candidates %}
+            <span class="feed-diag warn">0 von {{ stat.entries }} versucht</span>
           {% else %}
-            <span class="feed-diag ok">{{ stat.articles }} von {{ stat.entries }} übernommen</span>
+            <details class="feed-detail">
+              <summary>
+                {% if stat.articles == 0 %}
+                  <span class="feed-diag warn">{{ stat.taken }} von {{ stat.entries }} versucht, 0 übernommen</span>
+                {% else %}
+                  <span class="feed-diag ok">{{ stat.articles }} von {{ stat.taken }} übernommen{% if stat.taken < stat.entries %} ({{ stat.entries }} im Feed insgesamt){% endif %}</span>
+                {% endif %}
+              </summary>
+              <ul class="candidate-list">
+                {% for c in stat.candidates %}
+                <li class="cand-{{ c.status }}">
+                  <span class="cand-badge {{ c.status }}">{% if c.status == 'full' %}Volltext{% elif c.status == 'headline' %}Kurzmeldung{% else %}Abgelehnt{% endif %}</span>
+                  <a href="{{ c.link }}" target="_blank" rel="noopener" title="{{ c.reason }}">{{ c.title }}</a>
+                </li>
+                {% endfor %}
+              </ul>
+            </details>
           {% endif %}
         </td>
         <td class="url">{{ f.url }}</td>
@@ -1308,7 +1411,7 @@ cat > "$STAGE/app/templates/front_page.html" <<'ZEITUNG_FILE_EOF'
 <main>
   <article class="lead" data-slug="{{ lead.slug }}">
     {% if lead.image %}<img src="{{ lead.image }}" alt="">{% endif %}
-    <span class="kicker">{{ lead.category }}</span>
+    <span class="kicker">{{ lead.category }}{% if not lead.full_text %} · Kurzmeldung{% endif %}</span>
     <h2><a href="{{ lead.slug }}.html">{{ lead.title }}</a></h2>
     <p class="excerpt{% if not lead.image %} drop-cap{% endif %}">{{ lead.excerpt }}</p>
     <a class="readmore" href="{{ lead.slug }}.html">Weiterlesen →</a>
@@ -1321,8 +1424,14 @@ cat > "$STAGE/app/templates/front_page.html" <<'ZEITUNG_FILE_EOF'
       {% for t in arts %}
       <article class="teaser" data-slug="{{ t.slug }}">
         {% if t.image %}<img src="{{ t.image }}" alt="">{% endif %}
+        {% if not t.full_text %}
+        <span class="badge-short">Kurzmeldung</span>
+        <h3><a href="{{ t.slug }}.html">{{ t.title }}</a></h3>
+        <p class="excerpt teaser-source">{{ t.publisher or t.source }}</p>
+        {% else %}
         <h3><a href="{{ t.slug }}.html">{{ t.title }}</a></h3>
         <p class="excerpt">{{ t.excerpt }}</p>
+        {% endif %}
       </article>
       {% endfor %}
     </div>
@@ -1364,6 +1473,7 @@ cat > "$STAGE/app/templates/article.html" <<'ZEITUNG_FILE_EOF'
 <main>
   <div class="article-header">
     <span class="kicker">{{ a.category }}</span>
+    {% if not a.full_text %}<span class="badge-short">Kurzmeldung – kein Volltext verfügbar</span>{% endif %}
     <h1>{{ a.title }}</h1>
     <div class="byline">{{ a.publisher or a.source }}{% if a.author %} · {{ a.author }}{% endif %} · <a href="{{ a.link }}">Original lesen</a></div>
   </div>
@@ -1635,6 +1745,21 @@ main {
   color: var(--accent);
   font-family: Arial, sans-serif;
   margin-bottom: 6px;
+}
+
+.badge-short {
+  display: block;
+  font-size: 11px;
+  font-family: Arial, sans-serif;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #a87c00;
+  margin-bottom: 6px;
+}
+
+.teaser-source {
+  font-size: 13px;
+  font-style: italic;
 }
 
 .lead {
@@ -1998,6 +2123,57 @@ h2 { font-size: 16px; margin-top: 32px; border-bottom: 1px solid var(--border); 
   border-radius: 6px;
   cursor: pointer;
 }
+.local-unlimited-form {
+  margin-top: 10px;
+  font-size: 13px;
+  color: #555;
+}
+.local-unlimited-form label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.feed-detail summary {
+  cursor: pointer;
+  list-style: none;
+}
+.feed-detail summary::-webkit-details-marker { display: none; }
+.candidate-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 8px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  max-height: 260px;
+  overflow-y: auto;
+  min-width: 320px;
+}
+.candidate-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 0;
+  font-size: 13px;
+}
+.candidate-list a {
+  color: var(--ink);
+  text-decoration: none;
+}
+.candidate-list a:hover { text-decoration: underline; }
+.cand-badge {
+  flex-shrink: 0;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  color: #fff;
+}
+.cand-badge.full { background: #2e7d32; }
+.cand-badge.headline { background: #b8860b; }
+.cand-badge.rejected { background: #999; }
 .catalog-form { margin-top: 10px; }
 .catalog-group {
   border: 1px solid var(--border);
@@ -2462,10 +2638,11 @@ ExecStart=/opt/zeitung/venv/bin/python /opt/zeitung/app/run_generate.py
 ZEITUNG_FILE_EOF
 cat > "$STAGE/systemd/zeitung-generate.timer" <<'ZEITUNG_FILE_EOF'
 [Unit]
-Description=Taegliche Zeitungserstellung um 05:30 Uhr
+Description=Taegliche Zeitungserstellung um 05:30 Uhr (mit Wiederholung um 08:00 Uhr bei Totalausfall)
 
 [Timer]
 OnCalendar=*-*-* 05:30:00
+OnCalendar=*-*-* 08:00:00
 Persistent=true
 
 [Install]
