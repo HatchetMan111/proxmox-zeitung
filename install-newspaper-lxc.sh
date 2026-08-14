@@ -546,12 +546,21 @@ TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 
 env = Environment(loader=FileSystemLoader(str(TEMPLATES_DIR)))
 
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
 # Trafilatura wartet standardmaessig bis zu 30s pro Artikel - bei vielen Feeds
 # und ein paar langsamen/toten Seiten summiert sich das schnell auf mehrere
 # Minuten. 12s reicht fuer normale Nachrichtenseiten und haelt die
-# Gesamtgenerierung in einem vorhersehbaren Rahmen.
+# Gesamtgenerierung in einem vorhersehbaren Rahmen. Ausserdem ein normaler
+# Browser-User-Agent statt trafilaturas Standard, da manche Seiten (u.a.
+# Google-Redirects) erkennbare Bot-User-Agents mit leeren/degradierten
+# Antworten abspeisen.
 TRAFILATURA_CONFIG = use_config()
 TRAFILATURA_CONFIG.set("DEFAULT", "DOWNLOAD_TIMEOUT", "12")
+TRAFILATURA_CONFIG.set("DEFAULT", "USER_AGENTS", USER_AGENT)
 
 PAPER_NAME = "LichtValleyZeitung"
 
@@ -566,7 +575,6 @@ IMAGE_MAX_WIDTH = 1000
 IMAGE_MIN_WIDTH = 200
 IMAGE_MIN_HEIGHT = 150
 IMAGE_TIMEOUT = 8
-USER_AGENT = "Mozilla/5.0 (compatible; LichtValleyZeitung/1.0; +https://example.invalid)"
 
 
 def format_date_de(dt: datetime) -> str:
@@ -634,7 +642,7 @@ def fetch_candidates(feeds, max_per_feed=8, local_max_per_feed=None):
         error = None
         parsed = None
         try:
-            parsed = feedparser.parse(feed["url"])
+            parsed = feedparser.parse(feed["url"], request_headers={"User-Agent": USER_AGENT})
             entries_found = len(parsed.entries)
             if getattr(parsed, "bozo", False) and not parsed.entries:
                 error = str(parsed.get("bozo_exception")) or "Feed konnte nicht gelesen werden"
@@ -1101,7 +1109,10 @@ import urllib.parse
 import urllib.request
 
 PLZ_RE = re.compile(r"^\d{5}$")
-USER_AGENT = "Mozilla/5.0 (compatible; LichtValleyZeitung/1.0)"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 TIMEOUT = 8
 
 
@@ -1125,13 +1136,14 @@ def resolve_plz_de(plz: str):
 
 
 def local_news_feed_url(place: str) -> str:
-    """Google-News-Stichwortsuche nach dem Ortsnamen. Laut aktuellen
-    Erfahrungsberichten (Stand 2026) ist die Suche fuer praezises lokales
-    Monitoring zuverlaessiger als der geo-Feed. Ohne Anfuehrungszeichen
-    (keine Exakt-Phrasen-Suche), damit auch kleinere Orte genug Treffer
-    bekommen."""
-    query = urllib.parse.quote(place)
+    """Google-News-Stichwortsuche nach dem Ortsnamen. Mehrteilige Ortsnamen
+    werden mit Bindestrich statt Leerzeichen verbunden (z.B. 'Bad-Mergentheim')
+    - das behandelt Google erkennbar als eine zusammengehoerige Ortsangabe statt
+    als zwei unabhaengige Suchbegriffe und liefert dadurch treffsicherere
+    Ergebnisse, gerade bei Orten mit generischen Namensbestandteilen wie 'Bad'."""
+    query = urllib.parse.quote(place.replace(" ", "-"))
     return f"https://news.google.com/rss/search?q={query}&hl=de&gl=DE&ceid=DE:de"
+
 ZEITUNG_FILE_EOF
 cat > "$STAGE/app/run_generate.py" <<'ZEITUNG_FILE_EOF'
 import json
