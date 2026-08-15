@@ -936,9 +936,24 @@ def build_edition(
 
     extracted = deduplicate_articles(extracted)
 
-    # Bester Artikel insgesamt wird Aufmacher.
+    # Aufmacher: aus der laut Rubrik-Reihenfolge zuerst stehenden Rubrik (mit
+    # Artikeln), dort der bestbewertete. So fuehrt "Technik zuerst" auch
+    # wirklich zu einer Technik-Schlagzeile, statt dass eine andere Rubrik per
+    # Prioritaet/Textlaenge querschiesst. Ohne gesetzte Reihenfolge (oder wenn
+    # keine der geordneten Rubriken Artikel hat): der global bestbewertete
+    # Artikel, wie bisher.
     extracted.sort(key=score_article, reverse=True)
-    lead = extracted[0]
+    best_per_category = {}
+    for a in extracted:
+        best_per_category.setdefault(a["category"], a)
+
+    lead = None
+    for cat in category_order:
+        if cat in best_per_category:
+            lead = best_per_category[cat]
+            break
+    if lead is None:
+        lead = extracted[0]
 
     # Nach Rubrik gruppieren (jede Rubrik bekommt spaeter ihre eigene(n) Seite(n)),
     # pro Rubrik gedeckelt, damit keine einzelne Rubrik die ganze Ausgabe dominiert.
