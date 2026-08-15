@@ -32,6 +32,7 @@ mkdir -p "$STAGE/app/templates" "$STAGE/app/static" "$STAGE/systemd"
 
 cat > "$STAGE/app/main.py" <<'ZEITUNG_FILE_EOF'
 import json
+import re
 from pathlib import Path
 
 from fastapi import FastAPI, Form, Request
@@ -206,6 +207,34 @@ def feeds_local(plz: str = Form(...)):
 
     db.add_feed(url, f"Lokal: {place} ({plz})", "Lokales", priority=2)
     db.set_setting("last_status", f"Lokale Rubrik für {place} (PLZ {plz}) eingerichtet.")
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/feeds/local/repair")
+def feeds_local_repair():
+    """Aktualisiert bereits gespeicherte Lokal-Feed-URLs auf das aktuelle
+    Abfrageformat (z.B. wenn sich local_news_feed_url() seit dem Einrichten
+    des Feeds geaendert hat - ein App-Update allein aendert nichts an bereits
+    in der Datenbank gespeicherten URLs)."""
+    repaired = 0
+    for f in db.feeds_by_category("Lokales"):
+        if "news.google.com" not in f["url"]:
+            continue
+        m = re.search(r"\((\d{5})\)", f["name"] or "")
+        if not m:
+            continue
+        place = local_news.resolve_plz_de(m.group(1))
+        if not place:
+            continue
+        new_url = local_news.local_news_feed_url(place)
+        if new_url != f["url"] and db.update_feed_url(f["id"], new_url):
+            repaired += 1
+    db.set_setting(
+        "last_status",
+        f"{repaired} lokale Feed-URL(s) auf das aktuelle Format aktualisiert."
+        if repaired
+        else "Alle lokalen Feed-URLs waren bereits aktuell.",
+    )
     return RedirectResponse("/", status_code=303)
 
 
@@ -398,6 +427,31 @@ def add_feed(url, name, category, priority=1):
     )
     conn.commit()
     conn.close()
+
+
+def feeds_by_category(category):
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM feeds WHERE category = ?", (category,)).fetchall()
+    conn.close()
+    return rows
+
+
+def update_feed_url(feed_id, new_url):
+    """Aendert die URL eines bestehenden Feeds (z.B. um alte gespeicherte
+    Google-News-Lokal-URLs auf ein neues Abfrageformat zu migrieren)."""
+    conn = get_conn()
+    try:
+        conn.execute("UPDATE feeds SET url = ? WHERE id = ?", (new_url, feed_id))
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        # neue URL kollidiert mit einem bereits vorhandenen Feed (UNIQUE) -
+        # dann lieber den Duplikat-Eintrag entfernen als einen Fehler werfen.
+        conn.execute("DELETE FROM feeds WHERE id = ?", (feed_id,))
+        conn.commit()
+        return False
+    finally:
+        conn.close()
 
 
 def toggle_feed(feed_id):
@@ -1231,6 +1285,10 @@ cat > "$STAGE/app/templates/admin.html" <<'ZEITUNG_FILE_EOF'
       <input type="checkbox" name="enabled" value="1" {{ "checked" if local_unlimited else "" }} onchange="this.form.submit()">
       Alle lokalen Schlagzeilen anzeigen (auch als reine Kurzmeldung, statt nur die besten 6)
     </label>
+  </form>
+  <form method="post" action="/feeds/local/repair" class="local-repair-form">
+    <button type="submit">Lokale Feed-URLs reparieren</button>
+    <span class="hint">Falls "Lokal: ..." keine Artikel mehr liefert - aktualisiert die gespeicherte URL auf das neueste Abfrageformat.</span>
   </form>
 
   <h2>Feed-Katalog</h2>
@@ -2095,6 +2153,24 @@ h2 { font-size: 16px; margin-top: 32px; border-bottom: 1px solid var(--border); 
   gap: 6px;
 }
 
+.local-repair-form {
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.local-repair-form button {
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  background: #fff;
+  color: var(--ink);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.local-repair-form .hint { margin: 0; }
+
 .feed-detail summary {
   cursor: pointer;
   list-style: none;
@@ -2597,7 +2673,9 @@ pct exec "$CTID" -- bash -c "
   cp /opt/zeitung/systemd/zeitung-generate.timer /etc/systemd/system/ &&
   systemctl daemon-reload &&
   systemctl restart zeitung-generate.timer &&
-  systemctl restart zeitung-web.service
+  systemctl restart zeitung-web.service &&
+  sleep 2 &&
+  /opt/zeitung/venv/bin/python3 -c \"import urllib.request; urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8080/feeds/local/repair', method='POST'), timeout=10)\" || true
 "
 
 rm -rf "$STAGE"
